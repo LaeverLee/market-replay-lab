@@ -1,0 +1,71 @@
+{
+  "coverage": {
+    "available": true,
+    "start": "2020-01-01",
+    "through": "2026-11-05",
+    "intervals": [
+      "1m",
+      "3m",
+      "5m",
+      "15m",
+      "30m",
+      "1h",
+      "4h",
+      "1d"
+    ]
+  },
+  "verified_shards": {
+    "klines": 88,
+    "markPriceKlines": 88,
+    "fundingRate": 87
+  },
+  "trade_1m": {
+    "candles": 3601440,
+    "gaps": []
+  },
+  "mark_1m": {
+    "candles": 3586985,
+    "gaps": [
+      {
+        "expected": 1579439340000,
+        "observed": 1579441080000
+      },
+      {
+        "expected": 1608190320000,
+        "observed": 1608191760000
+      },
+      {
+        "expected": 1625097600000,
+        "observed": 1625184000000
+      },
+      {
+        "expected": 1627084800000,
+        "observed": 1627430400000
+      },
+      {
+        "expected": 1659225600000,
+        "observed": 1659312000000
+      },
+      {
+        "expected": 1664668800000,
+        "observed": 1664755200000
+      },
+      {
+        "expected": 1677196800000,
+        "observed": 1677283200000
+      },
+      {
+        "expected": 1723456920000,
+        "observed": 1723457040000
+      },
+      {
+        "expected": 1782691200000,
+        "observed": 1782777600000
+      },
+      {
+        "expected": 1793232000000,
+        "observed": 1793318400000
+      }
+    ]
+  }
+}

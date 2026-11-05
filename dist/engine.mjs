@@ -1,4 +1,4 @@
-export const frames = {'1m':60000,'5m':300000,'15m':900000,'30m':1800000,'1h':3600000,'4h':14400000,'1d':86400000};
+export const frames = {'1m':60000,'3m':180000,'5m':300000,'15m':900000,'30m':1800000,'1h':3600000,'4h':14400000,'1d':86400000};
 export const flags = ['enter_long','exit_long','enter_short','exit_short'];
 const fields = ['open','high','low','close','volume'];
 const ops = ['above','below','gte','lte','crossAbove','crossBelow'];

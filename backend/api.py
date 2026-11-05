@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if __package__ in ("", None):
     sys.path.insert(0, str(ROOT))
 
+from backend.history import HistoricalArchive
 from backend.repository import StrategyRepository
 from backend.services import ReplayService, RULE_ID
 from replay_engine.native import NativeCatalog
@@ -73,6 +74,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True})
             elif path == "/api/backtests" and method == "POST":
                 self.send_json(200, {"accounts": service.backtest(self.body(96 * 1024**2))})
+            elif path == "/api/history-coverage" and method == "GET":
+                self.send_json(200, service.history.coverage())
+            elif path == "/api/archive-backtests" and method == "POST":
+                self.send_json(200, service.archive_backtest(self.body(1024**2)))
             elif path == "/api/python-strategies" and method == "GET":
                 self.send_json(200, service.native_catalog.list())
             elif path == "/api/python-backtests" and method == "POST":
@@ -97,7 +102,9 @@ def main():
                                   Path(os.environ.get("LOCALAPPDATA", Path.home())) / "MarketReplayLab"))
     strategy_root = os.environ.get("MARKET_REPLAY_STRATEGY_ROOT", ROOT.parents[1] / "strategies")
     with ThreadingHTTPServer(("127.0.0.1", port), Handler) as server:
-        server.service = ReplayService(StrategyRepository(data_dir / "strategies.json"), NativeCatalog(strategy_root))
+        history_root = os.environ.get("MARKET_REPLAY_HISTORY_ROOT", ROOT / "history_data")
+        server.service = ReplayService(StrategyRepository(data_dir / "strategies.json"),
+                                       NativeCatalog(strategy_root), HistoricalArchive(history_root))
         print(f"Market Replay Lab: http://127.0.0.1:{port}", flush=True)
         server.serve_forever()
 

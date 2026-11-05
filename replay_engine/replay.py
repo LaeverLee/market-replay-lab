@@ -1,7 +1,7 @@
 from math import isfinite, inf
 
-FRAMES = dict(zip(("1m", "5m", "15m", "30m", "1h", "4h", "1d"),
-                  (60_000, 300_000, 900_000, 1_800_000, 3_600_000, 14_400_000, 86_400_000)))
+FRAMES = dict(zip(("1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"),
+                  (60_000, 180_000, 300_000, 900_000, 1_800_000, 3_600_000, 14_400_000, 86_400_000)))
 FLAGS = ("enter_long", "exit_long", "enter_short", "exit_short")
 FIELDS = ("open", "high", "low", "close", "volume")
 

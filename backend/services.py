@@ -54,9 +54,26 @@ def validate_rule(item):
 
 
 class ReplayService:
-    def __init__(self, repository, native_catalog):
+    def __init__(self, repository, native_catalog, history):
         self.repository = repository
         self.native_catalog = native_catalog
+        self.history = history
+
+    def archive_backtest(self, data):
+        if not isinstance(data, dict):
+            raise ValueError("回測設定無效。")
+        frame, native_id = data.get("frame"), data.get("id")
+        rows, start, end = self.history.read(frame, data.get("from"), data.get("to"),
+                                             warmup=0 if native_id else 1000)
+        period = [row for row in rows if row["t"] >= start]
+        if native_id:
+            return {"rows": period, "report": self.native_catalog.replay(native_id, period, frame)}
+        sizing = data.get("sizing")
+        if not isinstance(sizing, dict):
+            raise ValueError("回測帳戶設定無效。")
+        payload = dict(data, rows=rows, sizing={**sizing, "leverage": 3}, signalStrategies=[])
+        payload.update({"from": start, "to": end})
+        return {"rows": period, "accounts": self.backtest(payload)}
 
     def save_rules(self, items):
         if not isinstance(items, list) or len(items) > 1000:

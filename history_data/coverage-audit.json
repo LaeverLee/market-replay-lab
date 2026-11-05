@@ -1,0 +1,45 @@
+{
+  "coverage": {
+    "available": true,
+    "start": "2020-01-01",
+    "through": "2026-11-05",
+    "intervals": [
+      "1m",
+      "3m",
+      "5m",
+      "15m",
+      "30m",
+      "1h",
+      "4h",
+      "1d"
+    ]
+  },
+  "verified_shards": {
+    "klines": 88,
+    "markPriceKlines": 99,
+    "fundingRate": 87
+  },
+  "trade_1m": {
+    "candles": 3601440,
+    "gaps": []
+  },
+  "mark_1m": {
+    "candles": 3601387,
+    "gaps": [
+      {
+        "expected": 1579439340000,
+        "observed": 1579441080000
+      },
+      {
+        "expected": 1608190320000,
+        "observed": 1608191760000
+      }
+    ]
+  },
+  "funding": {
+    "events": 7503,
+    "first_ms": 1577836800000,
+    "last_ms": 1793894400000,
+    "largest_spacing_ms": 28800047
+  }
+}
