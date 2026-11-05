@@ -17,3 +17,8 @@ export const strategyApi={
   remove:id=>request('strategies/'+encodeURIComponent(id),'DELETE')
 };
 export const backtestApi=input=>request('backtests','POST',input);
+
+export const pythonStrategyApi={
+  list:()=>request('python-strategies'),
+  replay:input=>request('python-backtests','POST',input)
+};

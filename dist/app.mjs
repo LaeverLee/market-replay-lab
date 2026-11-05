@@ -1,4 +1,4 @@
-import {strategyApi,backtestApi} from './api.mjs';
+import {strategyApi,backtestApi,pythonStrategyApi} from './api.mjs';
 import {connectMarketFeed} from './live-feed.mjs';
 import {frames,flags,validateStrategy,parseCandles,validateCandles,computeSignals,makeAccount,onOpen,onClose,metrics,ledgerCsv} from './engine.mjs?v=intervals';
 
@@ -33,6 +33,13 @@ const marketName=market=>market==='futures'?'Binance USDⓈ-M 永續合約':'Bin
 const initial={capital:10000,allocation:100,fee:.1,slippage:.02};
 const supportedIntervals=Object.keys(frames);
 const strategies=[];
+let pythonStrategies=[];
+async function loadPythonStrategies(){
+  try{
+    pythonStrategies=await pythonStrategyApi.list();
+    if(selectedPage()==='backtest')render();
+  }catch(error){toast(error.message,true);}
+}
 const legacyStrategyKey='market-replay-strategies-v1';
 async function loadStrategies(){
   try{
@@ -55,7 +62,7 @@ async function loadStrategies(){
   }catch(error){toast(error.message,true);}
 }
 let market=null, result=null, live=null, historyError='', busy=false, toastTimer;
-const hist={source:'',symbol:'BTCUSDT',interval:'1h',intervalMode:'auto',from:'',to:'',...initial};
+const hist={source:'',nativeStrategy:'',symbol:'BTCUSDT',interval:'1h',intervalMode:'auto',from:'',to:'',...initial};
 const defaultLiveInterval='15m';
 const paper={market:'spot',symbol:'BTCUSDT',...initial};
 let ledgerPage={backtest:0,live:0};
@@ -255,9 +262,14 @@ async function backtest(){
   const settings=structuredClone(hist);
   try{
     const {source,interval}=settings, snapshot=strategies.find(s=>s.id===source&&s.type==='signals');
-    const frame=interval, step=frames[frame];
-    const ready=runnableStrategies(settings,'backtest');
-    const sizing=config(settings);makeAccount(sizing);
+    const native=pythonStrategies.find(strategy=>strategy.id===settings.nativeStrategy);
+    const frame=native?.interval??interval, step=frames[frame];
+    const ready=native?[]:runnableStrategies(settings,'backtest');
+    const sizing=config(settings);
+    if(!native)makeAccount(sizing);
+    if(native&&source!=='csv'&&(source!=='futures'||settings.symbol.trim().toUpperCase()!=='BTCUSDT')){
+      throw new Error('此 Python 策略需要 BTCUSDT 永續合約，或上傳相符的歷史行情 CSV。');
+    }
     const from=settings.from?Date.parse(settings.from+'T00:00:00Z'):-Infinity;
     const to=settings.to?Date.parse(settings.to+'T00:00:00Z')+86400000:Infinity;
     if(from>=to)throw new Error('開始日期須早於或等於結束日期。');
@@ -286,6 +298,12 @@ async function backtest(){
     validateCandles(rows,step);
     const period=rows.filter(c=>c.t>=from&&c.t<to);
     if(period.length<2)throw new Error('所選區間至少需有兩根已收盤 K 線。');
+    if(native){
+      const report=await pythonStrategyApi.replay({id:native.id,frame,rows:period});
+      result={accounts:[],rows:period,label:native.name+' · '+label,frame,report};
+      toast('完成 Python 策略回測');
+      return;
+    }
     const strategyIds=ready.filter(strategy=>strategy.type!=='signals').map(strategy=>strategy.id);
     const signalStrategies=ready.filter(strategy=>strategy.type==='signals').map(({id,name,color,candles})=>({
       id,name,color,signals:candles.map(row=>row.signals)
@@ -541,10 +559,10 @@ function overview(){
   '<div class="section-head"><h2>工作區概況</h2><span class="mono">SIMULATION / UTC+8</span></div><section class="stats" aria-label="工作區概況">'+
   stat('策略庫',String(strategies.length).padStart(2,'0'),'已匯入的策略','layers')+
   stat('最佳回測報酬',leadMetrics?pct(leadMetrics.returnPct):'—',lead?esc(lead.name):'等待回測','chart',leadMetrics?valueClass(leadMetrics.net):'')+
-  stat('已完成交易',result?String(result.accounts.reduce((n,a)=>n+metrics(a.account).trades,0)).padStart(2,'0'):'—','最近一批回測的平倉筆數','target')+
+  stat('已完成交易',result?String(result.report?.closed_trades??result.accounts.reduce((n,a)=>n+metrics(a.account).trades,0)).padStart(2,'0'):'—','最近一批回測的平倉筆數','target')+
   stat('即時執行策略',String(live?.status==='online'?live.accounts.length:0).padStart(2,'0'),live?esc(live.symbol+' · '+live.interval):'等待啟動即時工作階段','activity')+
   '</section><div class="grid-main">'+(result?plotPanel(result.accounts,result.label+' · '+day(result.rows[0].t)+' 至 '+day(result.rows.at(-1).t)+' UTC',result.frame):'<section class="panel"><div class="panel-head"><h2>策略權益曲線</h2><span class="tag neutral">歷史回測</span></div><div class="empty">'+'執行歷史回測後可查看權益曲線'+'</div></section>')+
-  '<section class="panel"><div class="panel-head"><div><h2>策略觀察清單</h2><p>在同一行情比較不同進出場規則</p></div><span class="tag">'+strategies.length+' 策略</span></div>'+(watch||'<div class="empty">匯入策略後會顯示在這裡</div>')+'<div class="panel-foot"><span class="muted">規則 JSON / 訊號 CSV</span><a class="text-link" href="#library">管理策略 '+icon('arrow')+'</a></div></section></div>'+(result?comparison(result.accounts):'');
+  '<section class="panel"><div class="panel-head"><div><h2>策略觀察清單</h2><p>在同一行情比較不同進出場規則</p></div><span class="tag">'+strategies.length+' 策略</span></div>'+(watch||'<div class="empty">匯入策略後會顯示在這裡</div>')+'<div class="panel-foot"><span class="muted">規則 JSON / 訊號 CSV</span><a class="text-link" href="#library">管理策略 '+icon('arrow')+'</a></div></section></div>'+(result?(result.report?nativeResult(result):comparison(result.accounts)):'');
 }
 const head=(label,title,subtitle,action='')=>'<div class="page-head"><div><p class="eyebrow">'+label+'</p><h1>'+title+'</h1><p>'+subtitle+'</p></div>'+action+'</div>';
 const input=(label,key,model,type='text',attrs='')=>'<label class="field">'+label+'<input name="'+key+'" type="'+type+'" value="'+esc(model[key])+'" '+attrs+'></label>';
@@ -577,15 +595,30 @@ function strategyList(model,mode){
     '<button type="button" class="text-link picker-import" data-action="import">'+icon('upload')+'匯入策略檔</button>'+
     (rows?'<ul class="strategy-list">'+rows+'</ul>':'<p class="picker-empty">目前沒有匯入的策略。</p>')+'</div>';
 }
+function nativeResult(result){
+  const {report,rows,label}=result;
+  const fills=report.fills.slice(-50).reverse().map(fill=>'<tr><td>'+esc(time(rows[fill.bar].t))+'</td><td>'+
+    esc(fill.kind==='entry'?'開倉':'平倉')+' / '+esc(fill.side===1?'多':'空')+'</td><td>'+quotePrice(fill.price)+
+    '</td><td>'+esc(fill.qty)+'</td><td>'+quotePrice(fill.fee)+'</td><td>'+esc(fill.reason)+'</td></tr>').join('');
+  return '<section class="panel table-panel"><div class="panel-head"><div><h2>Python 策略回測</h2><p>'+esc(label)+
+    '</p></div><button class="button ghost" data-action="download-python-report">下載完整帳務 JSON</button></div>'+
+    '<p>平倉 '+report.closed_trades+' 筆 · 期末權益 '+money(report.equity.at(-1).equity)+' USDT</p>'+
+    '<p class="muted">採用該策略版本的原始成交與帳務規則。顯示最近 50 筆成交。</p>'+
+    '<div class="table-scroll"><table><thead><tr><th>時間</th><th>成交</th><th>價格</th><th>數量</th><th>手續費</th><th>原因</th></tr></thead><tbody>'+
+    fills+'</tbody></table></div></section>';
+}
 function backtestPage(){
+  const native=pythonStrategies.find(strategy=>strategy.id===hist.nativeStrategy);
+  const picker=pythonStrategies.length?select('回測策略','nativeStrategy',
+    [['','已匯入的規則與訊號'],...pythonStrategies.map(strategy=>[strategy.id,strategy.name+' · Python '+strategy.interval])],hist.nativeStrategy):'';
   const sources=[['','請選擇行情來源'],['binance','Binance 現貨'],['futures','Binance USDⓈ-M 永續合約 · 3×'],...(market?[['csv',market.name]]:[]),...strategies.filter(s=>s.type==='signals').map(s=>[s.id,s.name+' · 訊號 CSV'])];
-  const marketFields=!hist.source?'':['binance','futures'].includes(hist.source)?'<div class="row">'+input('交易對','symbol',hist,'text','required maxlength="20"')+intervalInput(hist,'backtest')+'</div>':intervalInput(hist,'backtest');
+  const marketFields=native?'<p class="hint">'+esc(native.market)+' · '+esc(native.interval)+' · 使用策略版本的成交與帳務設定。</p>':!hist.source?'':['binance','futures'].includes(hist.source)?'<div class="row">'+input('交易對','symbol',hist,'text','required maxlength="20"')+intervalInput(hist,'backtest')+'</div>':intervalInput(hist,'backtest');
   return head('HISTORICAL REPLAY','歷史回測','選擇同一段行情，逐根比較策略的成交與權益。')+
-  '<div class="tool-grid"><section class="panel"><form id="backtest-form" class="config"><h2>回測設定</h2>'+select('行情來源','source',sources,hist.source)+
+  '<div class="tool-grid"><section class="panel"><form id="backtest-form" class="config"><h2>回測設定</h2>'+picker+select('行情來源','source',sources,hist.source)+
   '<button type="button" class="button ghost" data-action="market-file">'+icon('upload')+'上傳行情 CSV</button>'+marketFields+
-  '<div class="row">'+input('起始日 · UTC','from',hist,'date')+input('結束日 · UTC','to',hist,'date')+'</div>'+sizingFields(hist)+strategyList(hist,'backtest')+
-  '<p class="hint">收盤產生訊號，下一根開盤模擬成交。區間結束時按收盤估值。</p><button class="button primary" '+(busy?'disabled':'')+'>'+icon('play')+(busy?'回測執行中…':'執行回測')+'</button>'+(historyError?'<p class="error" role="alert">'+esc(historyError)+'</p>':'')+'</form></section>'+
-  '<div>'+(result?candlePanel(result.rows,result.frame)+plotPanel(result.accounts,result.label+' · '+day(result.rows[0].t)+' 至 '+day(result.rows.at(-1).t)+' UTC',result.frame)+comparison(result.accounts)+ledger(result.accounts,'backtest'):'<section class="panel"><div class="empty">匯入策略並執行回測，以查看績效與逐筆成交</div></section>')+'</div></div>';
+  '<div class="row">'+input('起始日 · UTC','from',hist,'date')+input('結束日 · UTC','to',hist,'date')+'</div>'+(native?'':sizingFields(hist)+strategyList(hist,'backtest'))+
+  '<p class="hint">'+(native?'選用 CSV 時請提供符合策略契約的 BTCUSDT 永續合約歷史行情。':'收盤產生訊號，下一根開盤模擬成交。區間結束時按收盤估值。')+'</p><button class="button primary" '+(busy?'disabled':'')+'>'+icon('play')+(busy?'回測執行中…':'執行回測')+'</button>'+(historyError?'<p class="error" role="alert">'+esc(historyError)+'</p>':'')+'</form></section>'+
+  '<div>'+(result?candlePanel(result.rows,result.frame)+(result.report?nativeResult(result):plotPanel(result.accounts,result.label+' · '+day(result.rows[0].t)+' 至 '+day(result.rows.at(-1).t)+' UTC',result.frame)+comparison(result.accounts)+ledger(result.accounts,'backtest')):'<section class="panel"><div class="empty">匯入策略並執行回測，以查看績效與逐筆成交</div></section>')+'</div></div>';
 }
 function liveQuotePanel(){
   if(!live)return '<section class="panel"><div class="panel-head"><h2>即時行情</h2><span class="badge"><i></i>尚未連線</span></div><div class="empty">選擇交易對即可接收 Binance 即時行情</div></section>';
@@ -731,6 +764,13 @@ $('main').addEventListener('change',e=>{
     paper.market=e.target.value;
     pairQuery='';
     applyLivePairs();
+  }else if(e.target.name==='nativeStrategy'){
+    hist.nativeStrategy=e.target.value;
+    if(hist.nativeStrategy){
+      hist.symbol='BTCUSDT';
+      if(hist.source!=='csv')setHistorySource('futures');
+    }
+    historyError='';render();
   }else if(e.target.name==='source'){
     setHistorySource(e.target.value);
     historyError='';render();
@@ -750,6 +790,10 @@ $('main').addEventListener('click',async e=>{
   else if(action==='market-file')$('market-file').click();
   else if(action==='toggle-live')toggleLive();
   else if(action==='stop-live')stopLive();
+  else if(action==='download-python-report'&&result?.report){
+    const report={strategy:result.label,frame:result.frame,candle_timestamps:result.rows.map(row=>row.t),...result.report};
+    download('python-backtest.json',JSON.stringify(report,null,2),'application/json');
+  }
   else if(action==='retry-live-pairs'){
     void loadLivePairs(paper.market);
     render();
@@ -775,3 +819,4 @@ $('main').addEventListener('click',async e=>{
 window.addEventListener('hashchange',()=>{render();window.scrollTo(0,0);});
 render();
 void loadStrategies();
+void loadPythonStrategies();
