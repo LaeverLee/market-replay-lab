@@ -18,12 +18,16 @@ const colors=['#287b5c','#5274a9','#a57039','#855798','#a64f54','#427e89'];
 const names={overview:'研究總覽',backtest:'歷史回測',live:'即時模擬',library:'策略庫',guide:'策略格式'};
 const selectedPage=()=>Object.hasOwn(names,location.hash.slice(1))?location.hash.slice(1):'overview';
 const money=x=>Number(x).toLocaleString('en-US',{maximumFractionDigits:2,minimumFractionDigits:2});
+const quotePrice=new Intl.NumberFormat('en-US',{minimumFractionDigits:2,maximumFractionDigits:16}).format;
 const pct=x=>(x>0?'+':'')+x.toFixed(2)+'%';
 const valueClass=x=>x<0?'negative':x>0?'positive':'';
 const day=t=>new Date(t).toISOString().slice(0,10);
 const time=(t,seconds=false)=>new Intl.DateTimeFormat('zh-TW',{timeZone:'Asia/Taipei',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',...(seconds?{second:'2-digit',fractionalSecondDigits:3}:{}),hourCycle:'h23'}).format(t);
-const spotKlines='https://data-api.binance.vision/api/v3/klines';
-const futuresKlines='https://fapi.binance.com/fapi/v1/klines';
+const marketApi={
+  spot:'https://data-api.binance.vision/api/v3/',
+  futures:'https://fapi.binance.com/fapi/v1/'
+};
+const perpetualTypes=new Set(['PERPETUAL','TRADIFI_PERPETUAL']);
 const marketName=market=>market==='futures'?'Binance USDⓈ-M 永續合約':'Binance 現貨';
 const initial={capital:10000,allocation:100,fee:.1,slippage:.02};
 const supportedIntervals=Object.keys(frames);
@@ -34,6 +38,8 @@ let market=null, result=null, live=null, historyError='', busy=false, toastTimer
 const hist={source:'',symbol:'BTCUSDT',interval:'1h',intervalMode:'auto',from:'',to:'',...initial};
 const paper={market:'spot',symbol:'BTCUSDT',interval:'1m',intervalMode:'auto',...initial};
 let ledgerPage={backtest:0,live:0};
+const livePairs=new Map();
+let pairQuery='';
 
 function toast(message,bad=false){
   const box=$('toast');box.hidden=false;box.textContent=message;box.className='toast'+(bad?' bad':'');
@@ -95,16 +101,44 @@ $('market-file').onchange=async e=>{
   }catch(error){historyError=error.message;render();}
 };
 function bar(row){return {t:row[0],open:+row[1],high:+row[2],low:+row[3],close:+row[4],volume:+row[5],end:row[6]};}
-async function fetchBars(symbol,interval,limit,after,until,signal,market='spot'){
-  if(!/^[A-Z0-9]{5,20}$/.test(symbol)||!frames[interval])throw new Error('請輸入有效的交易對與週期。');
+async function fetchBars(symbol,interval,limit,after,until,signal,market='spot',allowEmpty=false){
+  if(!/^[\p{L}\p{N}_-]+$/u.test(symbol)||!Object.hasOwn(frames,interval))throw new Error('請輸入有效的交易對與週期。');
   const params=new URLSearchParams({symbol,interval,limit:String(limit)});
   if(after!==undefined)params.set('startTime',after);
   if(until!==undefined)params.set('endTime',until);
-  const response=await fetch((market==='futures'?futuresKlines:spotKlines)+'?'+params,{signal:signal??AbortSignal.timeout(12000),cache:'no-store'});
+  const response=await fetch(marketApi[market]+'klines?'+params,{signal:signal??AbortSignal.timeout(12000),cache:'no-store'});
   if(!response.ok)throw new Error('Binance 行情請求失敗（'+response.status+'）。請確認交易對或稍後重試。');
   const rows=(await response.json()).map(bar);
-  if(!rows.length)throw new Error('所選期間沒有行情。');
+  if(!rows.length&&!allowEmpty)throw new Error('所選期間沒有行情。');
   validateCandles(rows,frames[interval]);return rows;
+}
+function applyLivePairs(){
+  const pairs=livePairs.get(paper.market)?.pairs;
+  if(pairs&&!pairs.includes(paper.symbol)){
+    paper.symbol=pairs.includes('BTCUSDT')?'BTCUSDT':pairs[0];
+  }
+  if(pairs&&live&&live.status!=='stopped'&&!live.accounts.length&&live.market!==paper.market){
+    syncInterval(paper,'live');
+    startLive(true);
+  }else if(selectedPage()==='live')render();
+}
+async function loadLivePairs(venue){
+  const catalog={pairs:null,failed:false};
+  livePairs.set(venue,catalog);
+  try{
+    const endpoint=venue==='spot'?'exchangeInfo?showPermissionSets=false':'exchangeInfo';
+    const response=await fetch(marketApi[venue]+endpoint,{signal:AbortSignal.timeout(12000),cache:'no-store'});
+    if(!response.ok)throw new Error('Binance exchangeInfo '+response.status);
+    const {symbols}=await response.json();
+    const pairs=symbols.filter(item=>item.status==='TRADING'&&
+      (venue==='spot'?item.isSpotTradingAllowed:perpetualTypes.has(item.contractType)))
+      .map(item=>item.symbol);
+    if(!pairs.length)throw new Error('Empty symbol catalog');
+    catalog.pairs=[...new Set(pairs)].sort((a,b)=>a.localeCompare(b,'en'));
+  }catch{
+    catalog.failed=true;
+  }
+  if(paper.market===venue)applyLivePairs();
 }
 function config(model){
   const sizing=Object.fromEntries(Object.keys(initial).map(key=>[key,Number(model[key])]));
@@ -237,7 +271,7 @@ function updateTradeQuote(session,trade){
     session.quoteFrame=null;
     if(live!==session||selectedPage()!=='live')return;
     const price=$('live-price'),quote=$('live-quote-time');
-    if(price)price.textContent=money(session.price);
+    if(price)price.textContent=quotePrice(session.price);
     if(quote)quote.textContent=quoteTime(session);
   });
 }
@@ -246,7 +280,7 @@ function openLiveFeed(session){
   session.disconnect=connectMarketFeed({
     symbol,interval,market,step:frames[interval],
     lastClosed:()=>session.history?.at(-1)?.t??null,
-    fetchHistory:(limit,after,until,signal)=>fetchBars(symbol,interval,limit,after,until,signal,market),
+    fetchHistory:(limit,after,until,signal)=>fetchBars(symbol,interval,limit,after,until,signal,market,after===undefined),
     onTrade:trade=>updateTradeQuote(session,trade),
     onBars:(warmup,closed,active)=>{
       if(warmup)session.history=warmup;
@@ -287,7 +321,7 @@ function setLiveChart(session,interval){
   view.disconnect=connectMarketFeed({
     symbol,interval,market,step:frames[interval],warmupLimit:120,
     lastClosed:()=>view.history.at(-1)?.t??null,
-    fetchHistory:(limit,after,until,signal)=>fetchBars(symbol,interval,limit,after,until,signal,market),
+    fetchHistory:(limit,after,until,signal)=>fetchBars(symbol,interval,limit,after,until,signal,market,after===undefined),
     onBars:(warmup,closed,active)=>{
       if(warmup||closed.length)view.history=[...(warmup??view.history),...closed].slice(-120);
       if(active||closed.length)view.activeBar=active;
@@ -302,12 +336,12 @@ function setLiveChart(session,interval){
 }
 function startLive(quotesOnly=false){
   try{
-    const symbol=paper.symbol.trim().toUpperCase(), interval=paper.interval;
-    if(!/^[A-Z0-9]{5,20}$/.test(symbol))throw new Error('請輸入交易所支援的交易對，例如 BTCUSDT。');
+    const {symbol,interval,market}=paper;
+    if(!livePairs.get(market)?.pairs?.includes(symbol))throw new Error('請從目前市場的清單選擇交易對。');
     if(!Object.hasOwn(frames,interval))throw new Error('K 線週期不受支援。');
     const connected=live&&live.status!=='stopped';
     if(connected&&live.accounts.length)return;
-    const same=connected&&live.symbol===symbol&&live.interval===interval&&live.market===paper.market;
+    const same=connected&&live.symbol===symbol&&live.interval===interval&&live.market===market;
     if(same&&quotesOnly)return;
     if(same&&live.status!=='online')throw new Error('請等行情連線完成後再啟動模擬。');
     const ready=quotesOnly?[]:runnableStrategies(paper,'live');
@@ -320,9 +354,12 @@ function startLive(quotesOnly=false){
       live.startedAt=startedAt;
       render();
     }else{
+      const chartInterval=live?.chart?.interval;
       if(connected){live.disconnect?.();live.chart?.disconnect?.();}
-      live={symbol,interval,market:paper.market,accounts,startedAt,status:'connecting',error:'',updated:null,price:null};
-      render();openLiveFeed(live);
+      live={symbol,interval,market,accounts,startedAt,status:'connecting',error:'',updated:null,price:null};
+      render();
+      openLiveFeed(live);
+      if(chartInterval&&chartInterval!==interval)setLiveChart(live,chartInterval);
     }
   }catch(e){toast(e.message,true);}
 }
@@ -357,7 +394,7 @@ function candlePlot(bars,interval,forming=false){
   const max=high+pad,min=low-pad;
   const space=(width-left-right)/bars.length;
   const y=price=>top+(max-price)/(max-min)*(height-top-bottom);
-  const decimals=high>=100?2:high>=1?4:8;
+  const decimals=Math.min(16,Math.max(2,Math.ceil(-Math.log10((max-min)/4))+1));
   const priceText=price=>price.toLocaleString('en-US',{maximumFractionDigits:decimals});
   const grid=Array.from({length:5},(_,i)=>{
     const price=max-(max-min)*i/4, p=y(price);
@@ -366,7 +403,7 @@ function candlePlot(bars,interval,forming=false){
   const sticks=bars.map((bar,i)=>{
     const x=left+(i+.5)*space, color=bar.close>=bar.open?'#198e69':'#d15b68';
     const bodyTop=Math.min(y(bar.open),y(bar.close)), bodyWidth=Math.max(1,space*.65);
-    const label=time(bar.t)+'｜開 '+priceText(bar.open)+'｜高 '+priceText(bar.high)+'｜低 '+priceText(bar.low)+'｜收 '+priceText(bar.close);
+    const label=time(bar.t)+'｜開 '+quotePrice(bar.open)+'｜高 '+quotePrice(bar.high)+'｜低 '+quotePrice(bar.low)+'｜收 '+quotePrice(bar.close);
     return '<g class="candle"><title>'+esc(label)+'</title><path d="M'+x+' '+y(bar.high)+'V'+y(bar.low)+'" stroke="'+color+'"/><rect x="'+(x-bodyWidth/2)+'" y="'+bodyTop+'" width="'+bodyWidth+'" height="'+Math.max(1,Math.abs(y(bar.open)-y(bar.close)))+'" fill="'+color+'" opacity="'+(forming&&i===bars.length-1?.65:1)+'"/></g>';
   }).join('');
   const ticks=[...new Set([0,Math.floor((bars.length-1)/2),bars.length-1])].map((i,index)=>'<text x="'+(left+(i+.5)*space)+'" y="'+(height-7)+'" text-anchor="'+(index===0?'start':i===bars.length-1?'end':'middle')+'">'+esc(time(bars[i].t))+'</text>').join('');
@@ -413,7 +450,7 @@ function ledger(accounts,kind){
   const page=Math.min(ledgerPage[kind],Math.max(0,Math.ceil(orders.length/12)-1));
   const exportBtn='<button class="button ghost" data-action="export-'+kind+'" '+(orders.length?'':'disabled')+'>'+icon('download')+'匯出 CSV</button>';
   if(!orders.length)return '<section class="panel table-panel"><div class="panel-head"><h2>逐筆成交</h2>'+exportBtn+'</div><div class="empty">目前沒有模擬成交</div></section>';
-  const body=orders.slice(page*12,(page+1)*12).map(o=>'<tr><td>'+esc(o.name)+'</td><td><time title="'+new Date(o.t).toISOString()+'">'+time(o.t)+'</time></td><td>'+(o.action==='entry'?'開倉':'平倉')+' / '+(o.side===1?'多':'空')+'</td><td class="mono">'+money(o.price)+'</td><td class="mono">'+o.qty.toPrecision(5)+'</td><td class="mono">'+money(o.fee)+'</td><td class="mono '+valueClass(o.pnl)+'">'+(o.pnl===null?'—':money(o.pnl))+'</td><td>'+esc(o.reason)+'</td></tr>').join('');
+  const body=orders.slice(page*12,(page+1)*12).map(o=>'<tr><td>'+esc(o.name)+'</td><td><time title="'+new Date(o.t).toISOString()+'">'+time(o.t)+'</time></td><td>'+(o.action==='entry'?'開倉':'平倉')+' / '+(o.side===1?'多':'空')+'</td><td class="mono">'+quotePrice(o.price)+'</td><td class="mono">'+o.qty.toPrecision(5)+'</td><td class="mono">'+money(o.fee)+'</td><td class="mono '+valueClass(o.pnl)+'">'+(o.pnl===null?'—':money(o.pnl))+'</td><td>'+esc(o.reason)+'</td></tr>').join('');
   return '<section class="panel table-panel"><div class="panel-head"><div><h2>逐筆成交</h2><p>成交時間顯示為台北時間</p></div>'+exportBtn+'</div><div class="table-scroll"><table><thead><tr><th>策略</th><th>成交時間</th><th>動作</th><th>成交價</th><th>數量</th><th>費用</th><th>淨損益</th><th>原因</th></tr></thead><tbody>'+body+'</tbody></table></div><div class="pagination"><button class="button ghost" data-action="prev-'+kind+'" '+(!page?'disabled':'')+'>上一頁</button><span class="muted">'+(page+1)+' / '+Math.ceil(orders.length/12)+' · '+orders.length+' 筆</span><button class="button ghost" data-action="next-'+kind+'" '+((page+1)*12>=orders.length?'disabled':'')+'>下一頁</button></div></section>';
 }
 function overview(){
@@ -470,7 +507,7 @@ function backtestPage(){
 function liveQuotePanel(){
   if(!live)return '<section class="panel"><div class="panel-head"><h2>即時行情</h2><span class="badge"><i></i>尚未連線</span></div><div class="empty">可先連線接收 Binance WebSocket 行情</div></section>';
   const label={online:'WebSocket 即時行情',connecting:'連線同步中',paused:'已暫停',error:'連線中斷',stopped:'已結束'}[live.status];
-  return '<section class="panel"><div class="panel-head"><div><h2>'+esc(live.symbol)+' <span class="muted">'+esc(live.interval)+' · '+marketName(live.market)+'</span></h2><p id="live-quote-time">'+quoteTime(live)+'</p></div><span class="badge '+(live.status==='online'?'online':'')+'"><i></i>'+label+'</span></div><div id="live-price" class="stat-value">'+(live.price===null?'—':money(live.price))+'</div>'+
+  return '<section class="panel"><div class="panel-head"><div><h2>'+esc(live.symbol)+' <span class="muted">'+esc(live.interval)+' · '+marketName(live.market)+'</span></h2><p id="live-quote-time">'+quoteTime(live)+'</p></div><span class="badge '+(live.status==='online'?'online':'')+'"><i></i>'+label+'</span></div><div id="live-price" class="stat-value">'+(live.price===null?'—':quotePrice(live.price))+'</div>'+
   (live.error?'<p class="error" role="alert">'+esc(live.error)+'</p>':'')+(live.status==='stopped'?'':'<div class="panel-foot"><span class="muted">'+(live.accounts.length?live.accounts.length+' 個虛擬帳戶':'目前只接收行情')+'</span><div class="session-controls"><button class="button ghost" data-action="toggle-live">'+(live.status==='paused'?'繼續':'暫停')+'</button><button class="button ghost" data-action="stop-live">'+(live.accounts.length?'結束':'中斷行情')+'</button></div></div>')+'</section>';
 }
 function liveCandleData(){
@@ -492,16 +529,41 @@ function liveCandlePanel(){
 function liveAccountPanels(){
   return live?.accounts.length?'<div class="table-panel">'+plotPanel(live.accounts,'收盤估值 · 各策略獨立帳戶',live.interval)+'</div>'+comparison(live.accounts)+ledger(live.accounts,'live'):'';
 }
+function filteredLivePairs(pairs){
+  const query=pairQuery.trim().toUpperCase().replace(/[\s/_-]/g,'');
+  return pairs.filter(pair=>pair.toUpperCase().replace(/[_-]/g,'').includes(query));
+}
+function livePairOptions(matches){
+  const values=matches.includes(paper.symbol)?matches:[paper.symbol,...matches];
+  return options(values.map(pair=>[pair,pair]),paper.symbol);
+}
+function livePairCount(pairs,matches){
+  return pairQuery.trim()?matches.length+' 個符合 · 共 '+pairs.length+' 個交易對':pairs.length+' 個可交易';
+}
+function livePairPicker(){
+  const catalog=livePairs.get(paper.market);
+  const pairs=catalog?.pairs;
+  if(!pairs){
+    const message=catalog?.failed?'交易對清單載入失敗':'正在載入交易對…';
+    const retry=catalog?.failed?'<button type="button" class="text-link" data-action="retry-live-pairs">重新載入交易對</button>':'';
+    return '<label class="field">交易對<select disabled><option>'+message+'</option></select></label>'+retry;
+  }
+  const matches=filteredLivePairs(pairs);
+  return '<label class="field">搜尋交易對<input id="live-pair-search" type="search" placeholder="例如 ETH 或 USDC" value="'+esc(pairQuery)+'"></label>'+
+    '<label class="field">交易對<select name="symbol" id="live-pair" aria-describedby="live-pair-count">'+livePairOptions(matches)+'</select></label>'+
+    '<small id="live-pair-count" class="muted" aria-live="polite">'+livePairCount(pairs,matches)+'</small>';
+}
 function livePage(){
   const connected=live&&live.status!=='stopped';
   const running=connected&&live.accounts.length;
+  const pairReady=livePairs.get(paper.market)?.pairs?.includes(paper.symbol);
   const fieldset=disabled=>'<fieldset '+(disabled?'disabled':'')+' style="border:0;padding:0;margin:0;min-width:0" class="config">';
   return head('LIVE PAPER TRADING','即時模擬','可先觀看行情，匯入策略後再啟動模擬。')+
   '<div class="tool-grid"><section class="panel"><form id="live-form" class="config"><h2>行情連線</h2>'+
-  fieldset(running)+select('行情市場','market',[['spot','Binance 現貨'],['futures','Binance USDⓈ-M 永續合約']],paper.market)+'<div class="row">'+input('交易對','symbol',paper,'text','required maxlength="20"')+intervalInput(paper,'live')+'</div>'+
-  '<button class="button ghost" value="quotes" formnovalidate>'+icon('activity')+(connected?'切換行情':'連線行情')+'</button></fieldset>'+
+  fieldset(running)+select('行情市場','market',[['spot','Binance 現貨'],['futures','Binance USDⓈ-M 永續合約']],paper.market)+livePairPicker()+intervalInput(paper,'live')+
+  '<button class="button ghost" value="quotes" formnovalidate '+(pairReady?'':'disabled')+'>'+icon('activity')+(connected?'套用行情設定':'連線行情')+'</button></fieldset>'+(running?'<p class="hint">結束本輪模擬後可切換市場或交易對。</p>':'')+
   '<h2>模擬設定</h2>'+fieldset(running)+sizingFields(paper)+(paper.market==='futures'?'<p class="hint">3× 模擬 · 支援多空。以成交價估算保證金耗盡，不含資金費、標記價格或交易所強平規則。</p>':'')+strategyList(paper,'live')+
-  '<p class="hint">現貨價格來自逐筆成交，合約價格來自聚合成交。策略在 K 線確認收盤時產生訊號。</p><button class="button primary">'+icon('play')+'啟動即時模擬</button></fieldset></form></section><div><div id="live-quote">'+liveQuotePanel()+'</div>'+liveCandlePanel()+'<div id="live-accounts">'+liveAccountPanels()+'</div></div></div>';
+  '<p class="hint">現貨價格來自逐筆成交，合約價格來自聚合成交。策略在 K 線確認收盤時產生訊號。</p><button class="button primary" '+(pairReady?'':'disabled')+'>'+icon('play')+'啟動即時模擬</button></fieldset></form></section><div><div id="live-quote">'+liveQuotePanel()+'</div>'+liveCandlePanel()+'<div id="live-accounts">'+liveAccountPanels()+'</div></div></div>';
 }
 function library(){
   return head('STRATEGY LIBRARY','策略庫','匯入交易規則或標準訊號檔，供歷史回測與即時模擬執行。','<button class="button primary" data-action="import">'+icon('upload')+'匯入策略</button>')+
@@ -545,24 +607,43 @@ function render(){
   });
   updateFeed();
   $('main').innerHTML={overview,backtest:backtestPage,live:livePage,library,guide}[page]();
+  if(page==='live'&&!livePairs.has(paper.market))void loadLivePairs(paper.market);
 }
 function capture(form,model){
   const data=new FormData(form);
   for(const [key,value] of data)model[key]=value;
 }
 $('main').addEventListener('input',e=>{
+  if(e.target.id==='live-pair-search'){
+    pairQuery=e.target.value;
+    const pairs=livePairs.get(paper.market).pairs;
+    const matches=filteredLivePairs(pairs);
+    $('live-pair').innerHTML=livePairOptions(matches);
+    $('live-pair-count').textContent=livePairCount(pairs,matches);
+    return;
+  }
   const form=e.target.form;
   if(!form)return;
   const model=form.id==='backtest-form'?hist:paper;
+  if(model===paper&&['market','symbol'].includes(e.target.name))return;
   if(e.target.name)model[e.target.name]=e.target.value;
 });
 $('main').addEventListener('change',e=>{
   if(e.target.id==='live-chart-interval'){
     if(live&&!e.target.disabled&&Object.hasOwn(frames,e.target.value))setLiveChart(live,e.target.value);
+  }else if(e.target.id==='live-pair'){
+    paper.symbol=e.target.value;
+    pairQuery='';
+    syncInterval(paper,'live');
+    startLive(true);
+  }else if(e.target.name==='market'){
+    paper.market=e.target.value;
+    pairQuery='';
+    applyLivePairs();
   }else if(e.target.name==='source'){
     setHistorySource(e.target.value);
     historyError='';render();
-  }else if(['intervalMode','market'].includes(e.target.name))render();
+  }else if(e.target.name==='intervalMode')render();
 });
 $('main').addEventListener('submit',e=>{
   e.preventDefault();
@@ -578,6 +659,10 @@ $('main').addEventListener('click',e=>{
   else if(action==='market-file')$('market-file').click();
   else if(action==='toggle-live')toggleLive();
   else if(action==='stop-live')stopLive();
+  else if(action==='retry-live-pairs'){
+    void loadLivePairs(paper.market);
+    render();
+  }
   else if(action==='remove-strategy'&&s){
     const next=strategies.filter(x=>x.id!==id);
     try{localStorage.setItem('market-replay-strategies-v1',JSON.stringify(next.filter(x=>x.type!=='signals')));}catch(err){toast(err.message,true);return;}

@@ -24,7 +24,7 @@ export function connectMarketFeed({symbol,interval,market='spot',step,lastClosed
 
   function connect(){
     onStatus('connecting','');
-    const stream=symbol.toLowerCase();
+    const stream=encodeURIComponent(symbol.toLowerCase());
     const futures=market==='futures';
     const tradeType=futures?'aggTrade':'trade';
     const kline=stream+'@kline_'+interval;
@@ -40,7 +40,7 @@ export function connectMarketFeed({symbol,interval,market='spot',step,lastClosed
 
     function emit(events,warmup=null){
       const closed=[];
-      let active=null,last=warmup?.at(-1)?.t??lastClosed();
+      let active=null,last=warmup?.at(-1)?.t??lastClosed()??(events[0].t-step);
       for(const row of events){
         if(row.t<=last)continue;
         if(row.t!==last+step)throw new Error('偵測到 K 線缺口，正在重新同步。');
@@ -73,8 +73,8 @@ export function connectMarketFeed({symbol,interval,market='spot',step,lastClosed
         const rows=missing?await fetchHistory(missing,previous===null?undefined:previous+step,first.t-1,signal):[];
         if(socket!==ws||stopped)return;
         request=null;
-        if(missing&&(rows.at(-1)?.t!==first.t-step||
-          (previous===null?rows.length<2:rows.length!==missing||rows[0].t!==previous+step))){
+        if((rows.length&&rows.at(-1).t!==first.t-step)||
+          (previous!==null&&missing&&(rows.length!==missing||rows[0].t!==previous+step))){
           throw new Error('補齊 K 線尚未完成，正在重試。');
         }
         const events=[...buffer.values()].sort((a,b)=>a.t-b.t);
