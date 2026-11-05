@@ -5,11 +5,19 @@ const ops = ['above','below','gte','lte','crossAbove','crossBelow'];
 const fail = message => { throw new Error(message); };
 export function validateStrategy(s) {
   if (!s || s.version !== 1 || typeof s.name !== 'string' || !s.name.trim() || s.name.length > 80 || !['long','both'].includes(s.side)) fail('策略需包含 version: 1、name（1–80 字）與 side（long / both）。');
-  const allowed = ['name','version','side','interval','warmup','indicators','stopPct','takePct','id','color',...flags];
+  const allowed = ['name','version','side','interval','intervals','warmup','indicators','stopPct','takePct','id','color',...flags];
   const unknown = Object.keys(s).find(key=>!allowed.includes(key));
   if (unknown) fail('不支援的策略欄位：'+unknown);
   if (s.warmup !== undefined && (!Number.isInteger(s.warmup) || s.warmup < 0 || s.warmup > 500)) fail('warmup 必須為 0–500 的整數。');
-  if (s.interval !== undefined && !Object.hasOwn(frames,s.interval)) fail('策略 interval 不受支援。');
+  if (s.interval !== undefined && (typeof s.interval!=='string'||!Object.hasOwn(frames,s.interval))) fail('策略 interval 不受支援。');
+  if (s.intervals !== undefined) {
+    const list=s.intervals;
+    if (!Array.isArray(list)||!list.length||list.length>Object.keys(frames).length||
+        new Set(list).size!==list.length||list.some(value=>typeof value!=='string'||!Object.hasOwn(frames,value))) {
+      fail('策略 intervals 必須列出支援的週期，不可重複。');
+    }
+    if (s.interval&&!list.includes(s.interval)) fail('預設 interval 必須包含在 intervals 內。');
+  }
   const indicators = s.indicators ?? {};
   if (!indicators || typeof indicators !== 'object' || Array.isArray(indicators) || Object.keys(indicators).length > 20) fail('indicators 必須為物件，最多 20 個。');
   for (const [id,d] of Object.entries(indicators)) {
@@ -17,6 +25,7 @@ export function validateStrategy(s) {
   }
   const operand = value => Number.isFinite(value) || fields.includes(value) || Object.hasOwn(indicators,value);
   const out = {name:s.name.trim(),version:1,side:s.side,warmup:s.warmup??0,indicators,...(s.interval ? {interval:s.interval} : {})};
+  if (s.intervals) out.intervals=[...s.intervals];
   for (const key of flags) {
     const rules = s[key] ?? [];
     if (!Array.isArray(rules) || rules.length > 16 || rules.some(r=>!Array.isArray(r)||r.length!==3||!operand(r[0])||!ops.includes(r[1])||!operand(r[2]))) fail('條件格式有誤：'+key);
