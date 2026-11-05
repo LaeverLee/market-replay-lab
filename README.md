@@ -40,3 +40,23 @@
 雲端版會讀取儲存庫的歷史行情，可以執行規則 JSON 和訊號 CSV 回測。原生 Python 策略目錄未隨公開儲存庫部署。免費服務會休眠，重啟可能清除雲端上傳的策略，建議保留匯入檔。即時模擬仍在開啟的瀏覽器頁面運行。
 
 限制與配額見 [Render 免費方案](https://render.com/docs/free)。
+
+## PythonAnywhere 免費雲端部署
+
+使用免費 Beginner 帳號的 Web 頁面，新增 Manual configuration 的 Python 3.12 網站。將 GitHub 儲存庫下載到帳號家目錄的 `market-replay-lab`。部署只需要網站程式和公開歷史行情。
+
+把服務的 WSGI 設定檔設為以下內容，並啟用 Force HTTPS。把範例網域換成實際網站網域，並在家目錄建立權限為 600 的 `.market-replay-password`，保存自行產生的至少 16 字元密碼。
+
+    from pathlib import Path
+    import sys
+
+    base = Path.home()
+    sys.path.insert(0, str(base / "market-replay-lab"))
+    from backend.wsgi import create_application
+    application = create_application(
+        "YOUR-USERNAME.pythonanywhere.com",
+        (base / ".market-replay-password").read_text().strip(),
+        base / ".market-replay-data",
+    )
+
+登入帳號為 `market-replay`。匯入的規則策略存在該帳號的家目錄，可跨重啟保留。免費網站有一個 Web worker、512 MiB 空間，回測批次依序處理週期組。需依控制台提示延長網站效期。見 [PythonAnywhere 免費帳號](https://help.pythonanywhere.com/pages/FreeAccountsFeatures/)。

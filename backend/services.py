@@ -58,11 +58,11 @@ def validate_rule(item):
 
 
 class ReplayService:
-    def __init__(self, repository, native_catalog, history):
+    def __init__(self, repository, native_catalog, history, *, parallel_batch=True):
         self.repository = repository
         self.native_catalog = native_catalog
         self.history = history
-        self.batch_workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix="archive")
+        self.batch_workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix="archive") if parallel_batch else None
 
     def archive_backtest(self, data):
         if not isinstance(data, dict):
@@ -147,10 +147,13 @@ class ReplayService:
                 results.append(item)
             return frame, period, results
 
-        tasks = [self.batch_workers.submit(run_group, frame, items) for frame, items in groups.items()]
+        if self.batch_workers is None:
+            completed = (run_group(frame, items) for frame, items in groups.items())
+        else:
+            tasks = [self.batch_workers.submit(run_group, frame, items) for frame, items in groups.items()]
+            completed = (task.result() for task in tasks)
         results, charts = {}, {}
-        for task in tasks:
-            frame, rows, items = task.result()
+        for frame, rows, items in completed:
             if rows:
                 charts[frame] = rows
             results.update((item["id"], item) for item in items)
