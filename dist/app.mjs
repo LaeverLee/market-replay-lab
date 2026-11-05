@@ -31,8 +31,8 @@ let saved=[];
 try{saved=JSON.parse(localStorage.getItem('market-replay-strategies-v1')??'[]').map((s,i)=>({...validateStrategy(s),id:s.id,color:colors[(i+3)%colors.length]}));}catch{}
 const strategies=saved;
 let market=null, result=null, live=null, historyError='', busy=false, toastTimer;
-const hist={source:'',symbol:'BTCUSDT',interval:'1h',from:'',to:'',...initial};
-const paper={market:'spot',symbol:'BTCUSDT',interval:'1m',...initial};
+const hist={source:'',symbol:'BTCUSDT',interval:'1h',intervalMode:'auto',from:'',to:'',...initial};
+const paper={market:'spot',symbol:'BTCUSDT',interval:'1m',intervalMode:'auto',...initial};
 let ledgerPage={backtest:0,live:0};
 
 function toast(message,bad=false){
@@ -65,7 +65,7 @@ async function importStrategy(file){
     }else if(/\.csv$/i.test(file.name)){
       const {candles,hasSignals}=parseCandles(data);
       if(!hasSignals)throw new Error('策略 CSV 需有四欄訊號。只有行情欄位時，請在歷史回測匯入行情。');
-      const s={id,color,name:file.name.slice(0,-4),type:'signals',candles};
+      const s={id,color,name:file.name.slice(0,-4),type:'signals',candles,interval:inferCandleInterval(candles)};
       strategies.push(s);
       setHistorySource(id);
     }else throw new Error('請選擇 .json 或 .csv。');
@@ -88,7 +88,8 @@ $('market-file').onchange=async e=>{
   const file=e.target.files[0];e.target.value='';if(!file)return;
   try{
     if(file.size>35*1024*1024)throw new Error('檔案上限為 35 MB。');
-    market={name:file.name,...parseCandles(await file.text())};
+    const data=parseCandles(await file.text());
+    market={name:file.name,...data,interval:inferCandleInterval(data.candles)};
     setHistorySource('csv');
     historyError='';render();toast('已載入 '+market.candles.length.toLocaleString()+' 根 K 線');
   }catch(error){historyError=error.message;render();}
@@ -127,15 +128,32 @@ function strategyBlockReason(s,mode,frame,sourceRows,market){
 function historyCandles(source){
   return source==='csv'?market?.candles:strategies.find(s=>s.id===source)?.candles;
 }
+function inferCandleInterval(rows){
+  if(rows.length<2)return undefined;
+  const step=rows[1].t-rows[0].t;
+  const interval=supportedIntervals.find(key=>frames[key]===step);
+  if(interval&&rows.every((bar,i)=>i===0||bar.t-rows[i-1].t===step))return interval;
+}
+function requiredIntervals(model,mode){
+  if(mode==='backtest'){
+    const sourceInterval=model.source==='csv'?market?.interval:strategies.find(s=>s.id===model.source)?.interval;
+    if(sourceInterval)return [sourceInterval];
+  }
+  return [...new Set(strategies.filter(s=>s.type!=='signals'&&s.interval&&
+    (mode!=='live'||model.market==='futures'||s.side==='long')).map(s=>s.interval))];
+}
+function syncInterval(model,mode){
+  if(model.intervalMode!=='auto'){
+    model.interval=model.intervalMode;
+    return;
+  }
+  const required=requiredIntervals(model,mode);
+  if(required.length===1)model.interval=required[0];
+}
 function setHistorySource(source){
   hist.source=source;
   hist.from='';hist.to='';
-  const rows=historyCandles(source);
-  if(rows?.length>=2){
-    const step=rows[1].t-rows[0].t;
-    const interval=supportedIntervals.find(key=>frames[key]===step);
-    if(interval&&rows.every((bar,i)=>i===0||bar.t-rows[i-1].t===step))hist.interval=interval;
-  }
+  hist.intervalMode='auto';
 }
 function executionPlan(model,mode){
   const sourceRows=mode==='backtest'?historyCandles(model.source):null;
@@ -147,6 +165,7 @@ function executionPlan(model,mode){
 function runnableStrategies(model,mode){
   if(!strategies.length)throw new Error('請先匯入策略檔。');
   if(mode==='backtest'&&!model.source)throw new Error('請選擇行情來源或上傳行情 CSV。');
+  if(model.intervalMode==='auto'&&requiredIntervals(model,mode).length>1)throw new Error('策略需要不同週期。請在「K 線週期」選擇本次要執行的週期。');
   const ready=executionPlan(model,mode).filter(entry=>!entry.reason).map(entry=>entry.strategy);
   if(!ready.length)throw new Error('目前沒有符合設定的策略，請查看清單中的原因。');
   return ready;
@@ -263,26 +282,22 @@ function startLive(quotesOnly=false){
     const symbol=paper.symbol.trim().toUpperCase(), interval=paper.interval;
     if(!/^[A-Z0-9]{5,20}$/.test(symbol))throw new Error('請輸入交易所支援的交易對，例如 BTCUSDT。');
     if(!Object.hasOwn(frames,interval))throw new Error('K 線週期不受支援。');
-    let connected=live&&live.status!=='stopped';
+    const connected=live&&live.status!=='stopped';
     if(connected&&live.accounts.length)return;
-    if(connected&&quotesOnly){
-      if(live.symbol===symbol&&live.interval===interval&&live.market===paper.market)return;
-      live.disconnect?.();
-      live.status='stopped';
-      connected=false;
-    }
-    if(connected&&(live.symbol!==symbol||live.interval!==interval||live.market!==paper.market))throw new Error('請先按「切換行情」，再啟動模擬。');
-    if(connected&&live.status!=='online')throw new Error('請等行情連線完成後再啟動模擬。');
+    const same=connected&&live.symbol===symbol&&live.interval===interval&&live.market===paper.market;
+    if(same&&quotesOnly)return;
+    if(same&&live.status!=='online')throw new Error('請等行情連線完成後再啟動模擬。');
     const ready=quotesOnly?[]:runnableStrategies(paper,'live');
     const sizing=config(paper);
     const accounts=ready.map(s=>({id:s.id,name:s.name,color:s.color,strategy:structuredClone(s),account:makeAccount(sizing)}));
     const startedAt=quotesOnly?null:Date.now();
     ledgerPage.live=0;
-    if(connected){
+    if(same){
       live.accounts=accounts;
       live.startedAt=startedAt;
       render();
     }else{
+      if(connected)live.disconnect?.();
       live={symbol,interval,market:paper.market,accounts,startedAt,status:'connecting',error:'',updated:null,price:null};
       render();openLiveFeed(live);
     }
@@ -386,27 +401,33 @@ const head=(label,title,subtitle,action='')=>'<div class="page-head"><div><p cla
 const input=(label,key,model,type='text',attrs='')=>'<label class="field">'+label+'<input name="'+key+'" type="'+type+'" value="'+esc(model[key])+'" '+attrs+'></label>';
 const options=(values,current)=>values.map(([v,l])=>'<option value="'+esc(v)+'" '+(v===current?'selected':'')+'>'+esc(l)+'</option>').join('');
 const select=(label,key,values,current)=>'<label class="field">'+label+'<select name="'+key+'">'+options(values,current)+'</select></label>';
-const intervalInput=model=>select('K 線週期','interval',supportedIntervals.map(k=>[k,k]),model.interval);
+function intervalInput(model,mode){
+  const required=requiredIntervals(model,mode);
+  const auto=required.length>1?'自動（有多種週期）':'自動（'+(required[0]??model.interval)+'）';
+  return select('K 線週期','intervalMode',[['auto',auto],...supportedIntervals.map(k=>[k,k])],model.intervalMode);
+}
 const sizingFields=model=>'<div class="row">'+input('每個策略本金','capital',model,'number','required min="1" step="any"')+input('部位比例 %','allocation',model,'number','required min=".01" max="100" step="any"')+'</div><div class="row">'+input('單邊手續費 %','fee',model,'number','required min="0" max="4.99" step="any"')+input('單邊滑價 %','slippage',model,'number','required min="0" max="4.99" step="any"')+'</div>';
 function strategyList(model,mode){
   const plan=executionPlan(model,mode);
+  const required=requiredIntervals(model,mode);
   const running=mode==='live'&&live?.accounts.length&&live.status!=='stopped';
   const runningIds=new Set(running?live.accounts.map(account=>account.id):[]);
   const ready=plan.filter(entry=>!entry.reason).length;
-  const heading=running?'本次已啟動 '+runningIds.size+' 個':'符合設定 '+ready+' 個';
+  const mixed=!running&&model.intervalMode==='auto'&&required.length>1;
+  const heading=running?'本次已啟動 '+runningIds.size+' 個':mixed?'請先選擇週期':'符合設定 '+ready+' 個';
   const rows=plan.map(({strategy,reason})=>{
-    const status=runningIds.has(strategy.id)?'本次已啟動':reason||(running?'下次啟動時執行':'本次會執行');
+    const status=runningIds.has(strategy.id)?'本次已啟動':(mixed?(strategy.interval?'需要 '+strategy.interval+' 週期':'不限週期'):reason)||(running?'下次啟動時執行':'本次會執行');
     const style=reason&&!runningIds.has(strategy.id)?' neutral':'';
     return '<li><span>'+esc(strategy.name)+'</span><small class="tag'+style+'">'+esc(status)+'</small></li>';
   }).join('');
   return '<div class="strategy-picker"><div class="picker-head"><strong>已匯入策略</strong><span class="muted">'+heading+'</span></div>'+
-    '<p class="muted">執行時會使用所有符合設定的策略，各自使用一個模擬帳戶。</p>'+
+    '<p class="muted">'+(mixed?'策略需要 '+esc(required.join('、'))+'。請選擇這次要執行的週期。':'執行時會使用所有符合設定的策略，各自使用一個模擬帳戶。')+'</p>'+
     '<button type="button" class="text-link picker-import" data-action="import">'+icon('upload')+'匯入策略檔</button>'+
     (rows?'<ul class="strategy-list">'+rows+'</ul>':'<p class="picker-empty">目前沒有匯入的策略。</p>')+'</div>';
 }
 function backtestPage(){
   const sources=[['','請選擇行情來源'],['binance','Binance 現貨'],['futures','Binance USDⓈ-M 永續合約 · 3×'],...(market?[['csv',market.name]]:[]),...strategies.filter(s=>s.type==='signals').map(s=>[s.id,s.name+' · 訊號 CSV'])];
-  const marketFields=!hist.source?'':['binance','futures'].includes(hist.source)?'<div class="row">'+input('交易對','symbol',hist,'text','required maxlength="20"')+intervalInput(hist)+'</div>':intervalInput(hist);
+  const marketFields=!hist.source?'':['binance','futures'].includes(hist.source)?'<div class="row">'+input('交易對','symbol',hist,'text','required maxlength="20"')+intervalInput(hist,'backtest')+'</div>':intervalInput(hist,'backtest');
   return head('HISTORICAL REPLAY','歷史回測','選擇同一段行情，逐根比較策略的成交與權益。')+
   '<div class="tool-grid"><section class="panel"><form id="backtest-form" class="config"><h2>回測設定</h2>'+select('行情來源','source',sources,hist.source)+
   '<button type="button" class="button ghost" data-action="market-file">'+icon('upload')+'上傳行情 CSV</button>'+marketFields+
@@ -428,14 +449,14 @@ function livePage(){
   const fieldset=disabled=>'<fieldset '+(disabled?'disabled':'')+' style="border:0;padding:0;margin:0;min-width:0" class="config">';
   return head('LIVE PAPER TRADING','即時模擬','可先觀看行情，匯入策略後再啟動模擬。')+
   '<div class="tool-grid"><section class="panel"><form id="live-form" class="config"><h2>行情連線</h2>'+
-  fieldset(running)+select('行情市場','market',[['spot','Binance 現貨'],['futures','Binance USDⓈ-M 永續合約']],paper.market)+'<div class="row">'+input('交易對','symbol',paper,'text','required maxlength="20"')+intervalInput(paper)+'</div>'+
+  fieldset(running)+select('行情市場','market',[['spot','Binance 現貨'],['futures','Binance USDⓈ-M 永續合約']],paper.market)+'<div class="row">'+input('交易對','symbol',paper,'text','required maxlength="20"')+intervalInput(paper,'live')+'</div>'+
   '<button class="button ghost" value="quotes" formnovalidate>'+icon('activity')+(connected?'切換行情':'連線行情')+'</button></fieldset>'+
   '<h2>模擬設定</h2>'+fieldset(running)+sizingFields(paper)+(paper.market==='futures'?'<p class="hint">3× 模擬 · 支援多空。以成交價估算保證金耗盡，不含資金費、標記價格或交易所強平規則。</p>':'')+strategyList(paper,'live')+
   '<p class="hint">現貨價格來自逐筆成交，合約價格來自聚合成交。策略在 K 線確認收盤時產生訊號。</p><button class="button primary">'+icon('play')+'啟動即時模擬</button></fieldset></form></section><div id="live-results">'+livePanel()+'</div></div>';
 }
 function library(){
   return head('STRATEGY LIBRARY','策略庫','匯入交易規則或標準訊號檔，供歷史回測與即時模擬執行。','<button class="button primary" data-action="import">'+icon('upload')+'匯入策略</button>')+
-  (strategies.length?'<div class="strategy-grid">'+strategies.map(s=>'<article class="strategy-card"><div class="panel-head"><div class="watch-icon">'+icon(s.type==='signals'?'file':'layers')+'</div><span class="tag">已匯入</span></div><h2>'+esc(s.name)+'</h2><p class="muted">'+(s.type==='signals'?s.candles.length.toLocaleString()+' 根帶訊號的 K 線 · 歷史回測':esc((s.interval??'不限週期')+' · '+(s.side==='long'?'做多':'多空')+' · '+Object.keys(s.indicators).length+' 個指標'))+'</p><div class="panel-foot"><button class="danger-button" data-action="remove-strategy" data-id="'+esc(s.id)+'">移除</button>'+'</div></article>').join('')+'</div>':'<div class="empty">匯入策略檔後即可執行。</div>');
+  (strategies.length?'<div class="strategy-grid">'+strategies.map(s=>'<article class="strategy-card"><div class="panel-head"><div class="watch-icon">'+icon(s.type==='signals'?'file':'layers')+'</div><span class="tag">已匯入</span></div><h2>'+esc(s.name)+'</h2><p class="muted">'+(s.type==='signals'?s.candles.length.toLocaleString()+' 根帶訊號的 K 線 · '+esc(s.interval??'週期未辨識')+' · 歷史回測':esc((s.interval??'不限週期')+' · '+(s.side==='long'?'做多':'多空')+' · '+Object.keys(s.indicators).length+' 個指標'))+'</p><div class="panel-foot"><button class="danger-button" data-action="remove-strategy" data-id="'+esc(s.id)+'">移除</button>'+'</div></article>').join('')+'</div>':'<div class="empty">匯入策略檔後即可執行。</div>');
 }
 function guide(){
   return head('DATA & EXECUTION','策略格式與成交規則','兩種模式都執行符合設定的已匯入策略，並使用同一個成交模型。')+
@@ -448,6 +469,8 @@ function renderLiveResults(){
   const el=$('live-results');if(el)el.innerHTML=livePanel();
 }
 function render(){
+  syncInterval(hist,'backtest');
+  if(!live?.accounts.length||live.status==='stopped')syncInterval(paper,'live');
   const page=selectedPage();
   $('crumb').textContent=names[page];
   document.querySelectorAll('.rail nav a').forEach(a=>{
@@ -471,12 +494,12 @@ $('main').addEventListener('change',e=>{
   if(e.target.name==='source'){
     setHistorySource(e.target.value);
     historyError='';render();
-  }else if(['interval','market'].includes(e.target.name))render();
+  }else if(['intervalMode','market'].includes(e.target.name))render();
 });
 $('main').addEventListener('submit',e=>{
   e.preventDefault();
-  if(e.target.id==='backtest-form'){capture(e.target,hist);backtest();}
-  else if(e.target.id==='live-form'){capture(e.target,paper);startLive(e.submitter?.value==='quotes');}
+  if(e.target.id==='backtest-form'){capture(e.target,hist);syncInterval(hist,'backtest');backtest();}
+  else if(e.target.id==='live-form'){capture(e.target,paper);syncInterval(paper,'live');startLive(e.submitter?.value==='quotes');}
 });
 $('main').addEventListener('click',e=>{
   const btn=e.target.closest('[data-action]');if(!btn)return;
