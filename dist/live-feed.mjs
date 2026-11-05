@@ -3,7 +3,7 @@ const futuresSocket='wss://fstream.binance.com/market/stream?streams=';
 const historyLimit=1000;
 const idleMs=20000;
 
-export function connectMarketFeed({symbol,interval,market='spot',step,lastClosed,fetchHistory,onBars,onTrade,onStatus}){
+export function connectMarketFeed({symbol,interval,market='spot',step,lastClosed,fetchHistory,onBars,onTrade,onStatus,warmupLimit=historyLimit}){
   let socket,retryTimer,watchdog,request,stopped=false,retries=0;
 
   function disconnect(){
@@ -27,7 +27,9 @@ export function connectMarketFeed({symbol,interval,market='spot',step,lastClosed
     const stream=symbol.toLowerCase();
     const futures=market==='futures';
     const tradeType=futures?'aggTrade':'trade';
-    const ws=new WebSocket((futures?futuresSocket:spotSocket)+stream+'@'+tradeType+'/'+stream+'@kline_'+interval);
+    const kline=stream+'@kline_'+interval;
+    const streams=onTrade?stream+'@'+tradeType+'/'+kline:kline;
+    const ws=new WebSocket((futures?futuresSocket:spotSocket)+streams);
     socket=ws;
     let synced=false,buffer=null;
 
@@ -54,7 +56,7 @@ export function connectMarketFeed({symbol,interval,market='spot',step,lastClosed
     async function sync(first){
       buffer=new Map([[first.t,first]]);
       const previous=lastClosed();
-      const missing=previous===null?historyLimit:(first.t-previous)/step-1;
+      const missing=previous===null?warmupLimit:(first.t-previous)/step-1;
       if(previous!==null&&missing>historyLimit){
         disconnect();
         onStatus('paused','行情缺口超過 1,000 根 K 線。請結束本次模擬並重新啟動。');
@@ -94,7 +96,7 @@ export function connectMarketFeed({symbol,interval,market='spot',step,lastClosed
       try{payload=JSON.parse(event.data);}catch{return;}
       payload=payload?.data??payload;
       if(payload?.e==='serverShutdown'){retry('交易所即將關閉連線，正在重連。');return;}
-      if(payload?.e===tradeType&&payload.s===symbol){
+      if(onTrade&&payload?.e===tradeType&&payload.s===symbol){
         const price=Number(payload.p), id=futures?payload.a:payload.t;
         if(Number.isFinite(price)&&price>0&&Number.isSafeInteger(id)&&id>=0&&
           Number.isSafeInteger(payload.T)&&Math.abs(payload.T)<=8640000000000000){

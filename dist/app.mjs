@@ -273,7 +273,30 @@ function openLiveFeed(session){
     onStatus:(status,error)=>{
       session.status=status;
       session.error=error;
+      if(status==='paused')session.chart?.disconnect?.();
       refreshLive(session);
+    }
+  });
+}
+function setLiveChart(session,interval){
+  session.chart?.disconnect?.();
+  session.chart=null;
+  if(interval===session.interval){renderLiveCandle();return;}
+  const {symbol,market}=session;
+  const view=session.chart={interval,history:[],activeBar:null,status:'connecting',error:''};
+  view.disconnect=connectMarketFeed({
+    symbol,interval,market,step:frames[interval],warmupLimit:120,
+    lastClosed:()=>view.history.at(-1)?.t??null,
+    fetchHistory:(limit,after,until,signal)=>fetchBars(symbol,interval,limit,after,until,signal,market),
+    onBars:(warmup,closed,active)=>{
+      if(warmup||closed.length)view.history=[...(warmup??view.history),...closed].slice(-120);
+      if(active||closed.length)view.activeBar=active;
+      if(live===session&&session.chart===view)renderLiveCandle();
+    },
+    onStatus:(status,error)=>{
+      view.status=status;
+      view.error=status==='paused'?'圖表資料缺口過大。請切換到其他週期後再切回。':error;
+      if(live===session&&session.chart===view)renderLiveCandle();
     }
   });
 }
@@ -297,7 +320,7 @@ function startLive(quotesOnly=false){
       live.startedAt=startedAt;
       render();
     }else{
-      if(connected)live.disconnect?.();
+      if(connected){live.disconnect?.();live.chart?.disconnect?.();}
       live={symbol,interval,market:paper.market,accounts,startedAt,status:'connecting',error:'',updated:null,price:null};
       render();openLiveFeed(live);
     }
@@ -305,20 +328,29 @@ function startLive(quotesOnly=false){
 }
 function toggleLive(){
   if(!live||live.status==='stopped')return;
-  if(live.status==='paused'){live.disconnect?.();openLiveFeed(live);}
-  else{live.status='paused';live.disconnect?.();}
+  if(live.status==='paused'){
+    live.disconnect?.();openLiveFeed(live);
+    if(live.chart)setLiveChart(live,live.chart.interval);
+  }else{
+    live.status='paused';live.disconnect?.();live.chart?.disconnect?.();
+  }
   updateFeed();render();
 }
 function stopLive(){
   if(!live)return;
-  live.disconnect?.();live.status='stopped';live.error='';render();
+  live.disconnect?.();live.chart?.disconnect?.();live.status='stopped';live.error='';render();
 }
 
 const stat=(title,value,caption,glyphName,cls='')=>'<div class="stat"><div class="stat-top">'+title+icon(glyphName)+'</div><div class="stat-value '+cls+'">'+value+'</div><small>'+caption+'</small></div>';
-function candlePanel(rows,interval,forming=false){
+function candleSummary(rows,forming){
+  return rows.length?'最近 '+rows.length+' 根 · '+(forming?'含形成中的 K 線':'已收盤 K 線'):'等待 K 線資料';
+}
+function candlePanel(rows,interval){
   const bars=rows.slice(-120);
-  const header='<section class="panel table-panel candle-panel"><div class="panel-head"><div><h2>K 線圖</h2><p>最近 '+bars.length+' 根 · '+(forming?'含形成中的 K 線':'已收盤 K 線')+'</p></div><span class="tag">'+esc(interval)+'</span></div>';
-  if(!bars.length)return header+'<div class="chart-empty">等待 K 線資料</div></section>';
+  return '<section class="panel table-panel candle-panel"><div class="panel-head"><div><h2>K 線圖</h2><p>'+candleSummary(bars,false)+'</p></div><span class="tag">'+esc(interval)+'</span></div>'+candlePlot(bars,interval)+'</section>';
+}
+function candlePlot(bars,interval,forming=false){
+  if(!bars.length)return '<div class="chart-empty">等待 K 線資料</div>';
   const width=760,height=278,left=12,right=95,top=12,bottom=29;
   const high=Math.max(...bars.map(bar=>bar.high)),low=Math.min(...bars.map(bar=>bar.low));
   const pad=Math.max((high-low)*.06,high*.00005);
@@ -338,7 +370,7 @@ function candlePanel(rows,interval,forming=false){
     return '<g class="candle"><title>'+esc(label)+'</title><path d="M'+x+' '+y(bar.high)+'V'+y(bar.low)+'" stroke="'+color+'"/><rect x="'+(x-bodyWidth/2)+'" y="'+bodyTop+'" width="'+bodyWidth+'" height="'+Math.max(1,Math.abs(y(bar.open)-y(bar.close)))+'" fill="'+color+'" opacity="'+(forming&&i===bars.length-1?.65:1)+'"/></g>';
   }).join('');
   const ticks=[...new Set([0,Math.floor((bars.length-1)/2),bars.length-1])].map((i,index)=>'<text x="'+(left+(i+.5)*space)+'" y="'+(height-7)+'" text-anchor="'+(index===0?'start':i===bars.length-1?'end':'middle')+'">'+esc(time(bars[i].t))+'</text>').join('');
-  return header+'<svg class="chart" viewBox="0 0 '+width+' '+height+'" role="img" aria-label="'+esc(interval)+' K 線圖">'+grid+sticks+ticks+'</svg></section>';
+  return '<svg class="chart" viewBox="0 0 '+width+' '+height+'" role="img" aria-label="'+esc(interval)+' K 線圖">'+grid+sticks+ticks+'</svg>';
 }
 function chart(accounts){
   const curves=accounts.map(a=>({...a,curve:a.account.curve})).filter(a=>a.curve.length);
@@ -435,13 +467,30 @@ function backtestPage(){
   '<p class="hint">收盤產生訊號，下一根開盤模擬成交。區間結束時按收盤估值。</p><button class="button primary" '+(busy?'disabled':'')+'>'+icon('play')+(busy?'回測執行中…':'執行回測')+'</button>'+(historyError?'<p class="error" role="alert">'+esc(historyError)+'</p>':'')+'</form></section>'+
   '<div>'+(result?candlePanel(result.rows,result.frame)+plotPanel(result.accounts,result.label+' · '+day(result.rows[0].t)+' 至 '+day(result.rows.at(-1).t)+' UTC',result.frame)+comparison(result.accounts)+ledger(result.accounts,'backtest'):'<section class="panel"><div class="empty">匯入策略並執行回測，以查看績效與逐筆成交</div></section>')+'</div></div>';
 }
-function livePanel(){
+function liveQuotePanel(){
   if(!live)return '<section class="panel"><div class="panel-head"><h2>即時行情</h2><span class="badge"><i></i>尚未連線</span></div><div class="empty">可先連線接收 Binance WebSocket 行情</div></section>';
   const label={online:'WebSocket 即時行情',connecting:'連線同步中',paused:'已暫停',error:'連線中斷',stopped:'已結束'}[live.status];
   return '<section class="panel"><div class="panel-head"><div><h2>'+esc(live.symbol)+' <span class="muted">'+esc(live.interval)+' · '+marketName(live.market)+'</span></h2><p id="live-quote-time">'+quoteTime(live)+'</p></div><span class="badge '+(live.status==='online'?'online':'')+'"><i></i>'+label+'</span></div><div id="live-price" class="stat-value">'+(live.price===null?'—':money(live.price))+'</div>'+
-  (live.error?'<p class="error" role="alert">'+esc(live.error)+'</p>':'')+(live.status==='stopped'?'':'<div class="panel-foot"><span class="muted">'+(live.accounts.length?live.accounts.length+' 個虛擬帳戶':'目前只接收行情')+'</span><div class="session-controls"><button class="button ghost" data-action="toggle-live">'+(live.status==='paused'?'繼續':'暫停')+'</button><button class="button ghost" data-action="stop-live">'+(live.accounts.length?'結束':'中斷行情')+'</button></div></div>')+'</section>'+
-  candlePanel(live.activeBar?[...(live.history??[]).slice(-119),live.activeBar]:live.history??[],live.interval,Boolean(live.activeBar))+
-  (live.accounts.length?'<div class="table-panel">'+plotPanel(live.accounts,'收盤估值 · 各策略獨立帳戶',live.interval)+'</div>'+comparison(live.accounts)+ledger(live.accounts,'live'):'');
+  (live.error?'<p class="error" role="alert">'+esc(live.error)+'</p>':'')+(live.status==='stopped'?'':'<div class="panel-foot"><span class="muted">'+(live.accounts.length?live.accounts.length+' 個虛擬帳戶':'目前只接收行情')+'</span><div class="session-controls"><button class="button ghost" data-action="toggle-live">'+(live.status==='paused'?'繼續':'暫停')+'</button><button class="button ghost" data-action="stop-live">'+(live.accounts.length?'結束':'中斷行情')+'</button></div></div>')+'</section>';
+}
+function liveCandleData(){
+  const view=live.chart??live;
+  const {interval,activeBar}=view;
+  const history=view.history??[];
+  const bars=activeBar?[...history.slice(-119),activeBar]:history.slice(-120);
+  const inactive=live.status==='paused'||live.status==='stopped';
+  const message=live.chart&&!inactive&&(view.error||(view.status==='connecting'?'正在載入 '+interval+' K 線…':''))||'';
+  const plot=(message?'<p class="hint">'+esc(message)+'</p>':'')+candlePlot(bars,interval,Boolean(activeBar));
+  return {interval,inactive,summary:candleSummary(bars,Boolean(activeBar)),plot};
+}
+function liveCandlePanel(){
+  if(!live)return '';
+  const {interval,inactive,summary,plot}=liveCandleData();
+  const options=supportedIntervals.map(value=>'<option value="'+value+'"'+(value===interval?' selected':'')+'>'+value+'</option>').join('');
+  return '<section class="panel table-panel candle-panel"><div class="panel-head"><div><h2>K 線圖</h2><p id="live-candle-summary">'+summary+'</p></div><select id="live-chart-interval" aria-label="圖表週期" title="只切換圖表週期"'+(inactive?' disabled':'')+'>'+options+'</select></div><div id="live-candle-plot">'+plot+'</div></section>';
+}
+function liveAccountPanels(){
+  return live?.accounts.length?'<div class="table-panel">'+plotPanel(live.accounts,'收盤估值 · 各策略獨立帳戶',live.interval)+'</div>'+comparison(live.accounts)+ledger(live.accounts,'live'):'';
 }
 function livePage(){
   const connected=live&&live.status!=='stopped';
@@ -452,7 +501,7 @@ function livePage(){
   fieldset(running)+select('行情市場','market',[['spot','Binance 現貨'],['futures','Binance USDⓈ-M 永續合約']],paper.market)+'<div class="row">'+input('交易對','symbol',paper,'text','required maxlength="20"')+intervalInput(paper,'live')+'</div>'+
   '<button class="button ghost" value="quotes" formnovalidate>'+icon('activity')+(connected?'切換行情':'連線行情')+'</button></fieldset>'+
   '<h2>模擬設定</h2>'+fieldset(running)+sizingFields(paper)+(paper.market==='futures'?'<p class="hint">3× 模擬 · 支援多空。以成交價估算保證金耗盡，不含資金費、標記價格或交易所強平規則。</p>':'')+strategyList(paper,'live')+
-  '<p class="hint">現貨價格來自逐筆成交，合約價格來自聚合成交。策略在 K 線確認收盤時產生訊號。</p><button class="button primary">'+icon('play')+'啟動即時模擬</button></fieldset></form></section><div id="live-results">'+livePanel()+'</div></div>';
+  '<p class="hint">現貨價格來自逐筆成交，合約價格來自聚合成交。策略在 K 線確認收盤時產生訊號。</p><button class="button primary">'+icon('play')+'啟動即時模擬</button></fieldset></form></section><div><div id="live-quote">'+liveQuotePanel()+'</div>'+liveCandlePanel()+'<div id="live-accounts">'+liveAccountPanels()+'</div></div></div>';
 }
 function library(){
   return head('STRATEGY LIBRARY','策略庫','匯入交易規則或標準訊號檔，供歷史回測與即時模擬執行。','<button class="button primary" data-action="import">'+icon('upload')+'匯入策略</button>')+
@@ -465,8 +514,25 @@ function guide(){
   '<section class="panel"><h2>成交及帳務</h2><p>每策略單一部位。訊號於已收盤 K 線決定，下一根開盤加上滑價後模擬成交。出場後等後續收盤再評估進場。同時出現多空進場時跳過。只有匯入的規則 JSON 指定停損或停利時，才會依相對成交價的變動產生出場指令。</p><p>回測可模擬 1 倍名義部位的多空；即時現貨支援做多，USDⓈ-M 永續合約支援 3 倍多空模擬。盈虧含雙邊費用，權益按收盤估值。合約以 3 倍名義金額及簡化保證金耗盡計算，不含資金費、標記價格、交易所強平規則、部分成交或委託簿。</p><p>暫停或斷線後，會補齊漏接的已收盤 K 線再繼續。缺口超過 1,000 根時會暫停。</p><a class="text-link" href="https://github.com/binance/binance-spot-api-docs/blob/master/faqs/market_data_only.md" target="_blank" rel="noopener">Binance 行情文件 '+icon('arrow')+'</a></section></div></div>';
 }
 
+function renderLiveCandle(){
+  const select=$('live-chart-interval');
+  if(!select||!live)return;
+  const {interval,inactive,summary,plot}=liveCandleData();
+  if(select.value!==interval)select.value=interval;
+  if(select.disabled!==inactive)select.disabled=inactive;
+  const caption=$('live-candle-summary');
+  if(caption.textContent!==summary)caption.textContent=summary;
+  $('live-candle-plot').innerHTML=plot;
+}
 function renderLiveResults(){
-  const el=$('live-results');if(el)el.innerHTML=livePanel();
+  const quote=$('live-quote'),accounts=$('live-accounts');
+  if(quote)quote.innerHTML=liveQuotePanel();
+  if(accounts)accounts.innerHTML=liveAccountPanels();
+  if(!live?.chart)renderLiveCandle();
+  else{
+    const select=$('live-chart-interval');
+    if(select&&select.disabled!==(live.status==='paused'||live.status==='stopped'))renderLiveCandle();
+  }
 }
 function render(){
   syncInterval(hist,'backtest');
@@ -491,7 +557,9 @@ $('main').addEventListener('input',e=>{
   if(e.target.name)model[e.target.name]=e.target.value;
 });
 $('main').addEventListener('change',e=>{
-  if(e.target.name==='source'){
+  if(e.target.id==='live-chart-interval'){
+    if(live&&!e.target.disabled&&Object.hasOwn(frames,e.target.value))setLiveChart(live,e.target.value);
+  }else if(e.target.name==='source'){
     setHistorySource(e.target.value);
     historyError='';render();
   }else if(['intervalMode','market'].includes(e.target.name))render();
