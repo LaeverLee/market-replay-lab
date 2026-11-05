@@ -1,5 +1,6 @@
+import {strategyApi,backtestApi} from './api.mjs';
 import {connectMarketFeed} from './live-feed.mjs';
-import {frames,flags,validateStrategy,parseCandles,validateCandles,computeSignals,makeAccount,onOpen,onClose,runBacktest,metrics,ledgerCsv} from './engine.mjs?v=intervals';
+import {frames,flags,validateStrategy,parseCandles,validateCandles,computeSignals,makeAccount,onOpen,onClose,metrics,ledgerCsv} from './engine.mjs?v=intervals';
 
 const $=id=>document.getElementById(id);
 const glyph={
@@ -31,9 +32,28 @@ const perpetualTypes=new Set(['PERPETUAL','TRADIFI_PERPETUAL']);
 const marketName=market=>market==='futures'?'Binance USDⓈ-M 永續合約':'Binance 現貨';
 const initial={capital:10000,allocation:100,fee:.1,slippage:.02};
 const supportedIntervals=Object.keys(frames);
-let saved=[];
-try{saved=JSON.parse(localStorage.getItem('market-replay-strategies-v1')??'[]').map((s,i)=>({...validateStrategy(s),id:s.id,color:colors[(i+3)%colors.length]}));}catch{}
-const strategies=saved;
+const strategies=[];
+const legacyStrategyKey='market-replay-strategies-v1';
+async function loadStrategies(){
+  try{
+    let items=await strategyApi.list();
+    const legacy=localStorage.getItem(legacyStrategyKey);
+    if(legacy){
+      const migrated=[];
+      for(const [i,entry] of JSON.parse(legacy).entries()){
+        try{
+          migrated.push({...validateStrategy(entry),id:entry.id,color:colors[(i+3)%colors.length]});
+        }catch{}
+      }
+      if(migrated.length)items=await strategyApi.add(migrated);
+      if(migrated.length===JSON.parse(legacy).length)localStorage.removeItem(legacyStrategyKey);
+    }
+    const existing=new Set(strategies.map(strategy=>strategy.id));
+    strategies.push(...items.filter(strategy=>!existing.has(strategy.id)));
+    syncLiveChart();
+    render();
+  }catch(error){toast(error.message,true);}
+}
 let market=null, result=null, live=null, historyError='', busy=false, toastTimer;
 const hist={source:'',symbol:'BTCUSDT',interval:'1h',intervalMode:'auto',from:'',to:'',...initial};
 const defaultLiveInterval='15m';
@@ -67,8 +87,7 @@ async function importStrategy(file){
     let importedRule;
     if(/\.json$/i.test(file.name)){
       const s={...validateStrategy(JSON.parse(data.replace(/^\uFEFF/,''))),id,color};
-      const next=[...strategies.filter(x=>x.type!=='signals'),s];
-      localStorage.setItem('market-replay-strategies-v1',JSON.stringify(next));
+      await strategyApi.add([s]);
       strategies.push(s);
       importedRule=s;
     }else if(/\.csv$/i.test(file.name)){
@@ -267,7 +286,11 @@ async function backtest(){
     validateCandles(rows,step);
     const period=rows.filter(c=>c.t>=from&&c.t<to);
     if(period.length<2)throw new Error('所選區間至少需有兩根已收盤 K 線。');
-    const accounts=ready.map(s=>({id:s.id,name:s.name,color:s.color,account:runBacktest(s.candles??rows,s,sizing,from,to)}));
+    const strategyIds=ready.filter(strategy=>strategy.type!=='signals').map(strategy=>strategy.id);
+    const signalStrategies=ready.filter(strategy=>strategy.type==='signals').map(({id,name,color,candles})=>({
+      id,name,color,signals:candles.map(row=>row.signals)
+    }));
+    const {accounts}=await backtestApi({frame,rows,sizing,from,to,strategyIds,signalStrategies});
     result={accounts,rows:period,label,frame};
     ledgerPage.backtest=0;toast('完成 '+accounts.length+' 個策略的回測');
   }catch(e){historyError=e.message;}finally{busy=false;render();}
@@ -639,7 +662,7 @@ function library(){
 function guide(){
   return head('DATA & EXECUTION','策略格式與成交規則','兩種模式都執行符合設定的已匯入策略，並使用同一個成交模型。')+
   '<div class="guide-grid"><section class="panel"><h2>規則 JSON</h2><p><code>version: 1</code>、<code>name</code>、<code>side</code>（<code>long</code> 或 <code>both</code>）為必填。可選 <code>interval</code>、<code>intervals</code>、<code>warmup</code>、<code>stopPct</code>、<code>takePct</code>。<code>interval</code> 可指定固定週期。多週期使用 <code>intervals</code>（例如 <code>["15m","1h"]</code>），第一個為預設，也可用 <code>interval</code> 指定清單內的預設週期。</p><p>指標可用 <code>sma</code>、<code>ema</code>、<code>rsi</code>、<code>high</code>、<code>low</code>。每個指標指定 <code>period</code>，可選 <code>source</code>，預設 <code>close</code>。<code>high</code> / <code>low</code> 取前 N 根，不含本根。</p><p>請填寫策略名稱和至少一組進場條件。每組訊號的條件全數成立才觸發。運算子支援 <code>above</code>、<code>below</code>、<code>gte</code>、<code>lte</code>、<code>crossAbove</code>、<code>crossBelow</code>。</p><button class="button ghost" data-action="template">'+icon('download')+'下載 JSON 範本</button><pre>'+esc(JSON.stringify(template,null,2))+'</pre></section>'+
-  '<div class="stack"><section class="panel"><h2>歷史行情與 Python 訊號</h2><p>行情 CSV 欄位為 <code>timestamp,open,high,low,close,volume</code>。時間戳使用含時區的 ISO 8601 或 Unix 秒／毫秒／微秒，以開盤時間標記。資料必須已收盤、遞增且符合所選週期。</p><p>現有 BTC 專案可先在 Python 呼叫 <code>generate_signals(candles)</code>，將行情和以下旗標匯出為 CSV，再從策略庫匯入。OHLCV 完全相同的訊號 CSV 可一起回測。</p><pre>'+flags.join(', ')+'</pre><p>已匯入的規則 JSON 存於此瀏覽器。CSV 資料與即時模擬帳戶在此頁工作階段內有效。</p></section>'+
+  '<div class="stack"><section class="panel"><h2>歷史行情與 Python 訊號</h2><p>行情 CSV 欄位為 <code>timestamp,open,high,low,close,volume</code>。時間戳使用含時區的 ISO 8601 或 Unix 秒／毫秒／微秒，以開盤時間標記。資料必須已收盤、遞增且符合所選週期。</p><p>現有 BTC 專案可先在 Python 呼叫 <code>generate_signals(candles)</code>，將行情和以下旗標匯出為 CSV，再從策略庫匯入。OHLCV 完全相同的訊號 CSV 可一起回測。</p><pre>'+flags.join(', ')+'</pre><p>已匯入的規則 JSON 儲存在本機後端。CSV 資料與即時模擬帳戶在此頁工作階段內有效。</p></section>'+
   '<section class="panel"><h2>成交及帳務</h2><p>每策略單一部位。訊號於已收盤 K 線決定，下一根開盤加上滑價後模擬成交。出場後等後續收盤再評估進場。同時出現多空進場時跳過。只有匯入的規則 JSON 指定停損或停利時，才會依相對成交價的變動產生出場指令。</p><p>回測可模擬 1 倍名義部位的多空；即時現貨支援做多，USDⓈ-M 永續合約支援 3 倍多空模擬。盈虧含雙邊費用，權益按收盤估值。合約以 3 倍名義金額及簡化保證金耗盡計算，不含資金費、標記價格、交易所強平規則、部分成交或委託簿。</p><p>暫停或斷線後，會補齊漏接的已收盤 K 線再繼續。缺口超過 1,000 根時會暫停。</p><a class="text-link" href="https://github.com/binance/binance-spot-api-docs/blob/master/faqs/market_data_only.md" target="_blank" rel="noopener">Binance 行情文件 '+icon('arrow')+'</a></section></div></div>';
 }
 
@@ -718,7 +741,7 @@ $('main').addEventListener('submit',e=>{
   if(e.target.id==='backtest-form'){capture(e.target,hist);syncInterval(hist,'backtest');backtest();}
   else if(e.target.id==='live-form'){capture(e.target,paper);startLive();}
 });
-$('main').addEventListener('click',e=>{
+$('main').addEventListener('click',async e=>{
   const btn=e.target.closest('[data-action]');if(!btn)return;
   const {action,id}=btn.dataset;
   const s=strategies.find(x=>x.id===id);
@@ -732,9 +755,11 @@ $('main').addEventListener('click',e=>{
     render();
   }
   else if(action==='remove-strategy'&&s){
-    const next=strategies.filter(x=>x.id!==id);
-    try{localStorage.setItem('market-replay-strategies-v1',JSON.stringify(next.filter(x=>x.type!=='signals')));}catch(err){toast(err.message,true);return;}
-    strategies.splice(strategies.indexOf(s),1);
+    try{if(s.type!=='signals')await strategyApi.remove(id);}
+    catch(err){toast(err.message,true);return;}
+    const index=strategies.indexOf(s);
+    if(index===-1)return;
+    strategies.splice(index,1);
     if(hist.source===id)setHistorySource('');
     syncLiveChart();
     render();toast('已移除 '+s.name);
@@ -749,3 +774,4 @@ $('main').addEventListener('click',e=>{
 });
 window.addEventListener('hashchange',()=>{render();window.scrollTo(0,0);});
 render();
+void loadStrategies();
