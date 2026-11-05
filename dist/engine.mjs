@@ -2,15 +2,10 @@ export const frames = {'1m':60000,'5m':300000,'15m':900000,'30m':1800000,'1h':36
 export const flags = ['enter_long','exit_long','enter_short','exit_short'];
 const fields = ['open','high','low','close','volume'];
 const ops = ['above','below','gte','lte','crossAbove','crossBelow'];
-export const builtins = [
-  {name:'雙均線趨勢',id:'trend',version:1,side:'long',warmup:26,indicators:{fast:{type:'ema',period:9},slow:{type:'ema',period:26}},enter_long:[['fast','crossAbove','slow']],exit_long:[['fast','crossBelow','slow']]},
-  {name:'RSI 均值回歸',id:'rsi',version:1,side:'long',warmup:15,indicators:{rsi:{type:'rsi',period:14}},enter_long:[['rsi','crossAbove',30]],exit_long:[['rsi','crossAbove',60]],stopPct:3,takePct:6},
-  {name:'區間突破',id:'breakout',version:1,side:'long',warmup:21,indicators:{top:{type:'high',period:20,source:'high'},floor:{type:'low',period:10,source:'low'}},enter_long:[['close','above','top']],exit_long:[['close','below','floor']]}
-];
 const fail = message => { throw new Error(message); };
 export function validateStrategy(s) {
   if (!s || s.version !== 1 || typeof s.name !== 'string' || !s.name.trim() || s.name.length > 80 || !['long','both'].includes(s.side)) fail('策略需包含 version: 1、name（1–80 字）與 side（long / both）。');
-  const allowed = ['name','version','side','interval','warmup','indicators','stopPct','takePct','id','color','builtin',...flags];
+  const allowed = ['name','version','side','interval','warmup','indicators','stopPct','takePct','id','color',...flags];
   const unknown = Object.keys(s).find(key=>!allowed.includes(key));
   if (unknown) fail('不支援的策略欄位：'+unknown);
   if (s.warmup !== undefined && (!Number.isInteger(s.warmup) || s.warmup < 0 || s.warmup > 500)) fail('warmup 必須為 0–500 的整數。');

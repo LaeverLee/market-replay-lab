@@ -11,8 +11,4 @@ main{max-width:1540px;margin:auto;padding:24px 30px 32px}.page-head{display:flex
 .picker-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px}
 .picker-import{background:none;border:0;padding:4px 0;cursor:pointer}
 .picker-empty{padding:8px;border:1px dashed var(--line);border-radius:7px;color:var(--muted);font-size:12px}
-.picker-examples{border:1px solid var(--line);border-radius:7px;padding:8px;font-size:12px}
-.picker-examples summary{cursor:pointer;font-weight:650}
-.picker-examples summary .muted{margin-left:4px;font-weight:400}
-.picker-examples .check-list{margin-top:8px}
 .check-list label:has(input:disabled){background:#f8faf7;color:var(--muted)}
