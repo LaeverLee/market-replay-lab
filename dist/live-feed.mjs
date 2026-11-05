@@ -1,8 +1,9 @@
-const socketEndpoint='wss://data-stream.binance.vision/stream?streams=';
+const spotSocket='wss://data-stream.binance.vision/stream?streams=';
+const futuresSocket='wss://fstream.binance.com/market/stream?streams=';
 const historyLimit=1000;
 const idleMs=20000;
 
-export function connectMarketFeed({symbol,interval,step,lastClosed,fetchHistory,onBars,onTrade,onStatus}){
+export function connectMarketFeed({symbol,interval,market='spot',step,lastClosed,fetchHistory,onBars,onTrade,onStatus}){
   let socket,retryTimer,watchdog,request,stopped=false,retries=0;
 
   function disconnect(){
@@ -24,7 +25,9 @@ export function connectMarketFeed({symbol,interval,step,lastClosed,fetchHistory,
   function connect(){
     onStatus('connecting','');
     const stream=symbol.toLowerCase();
-    const ws=new WebSocket(socketEndpoint+stream+'@trade/'+stream+'@kline_'+interval);
+    const futures=market==='futures';
+    const tradeType=futures?'aggTrade':'trade';
+    const ws=new WebSocket((futures?futuresSocket:spotSocket)+stream+'@'+tradeType+'/'+stream+'@kline_'+interval);
     socket=ws;
     let synced=false,buffer=null;
 
@@ -91,11 +94,11 @@ export function connectMarketFeed({symbol,interval,step,lastClosed,fetchHistory,
       try{payload=JSON.parse(event.data);}catch{return;}
       payload=payload?.data??payload;
       if(payload?.e==='serverShutdown'){retry('交易所即將關閉連線，正在重連。');return;}
-      if(payload?.e==='trade'&&payload.s===symbol){
-        const price=Number(payload.p);
-        if(Number.isFinite(price)&&price>0&&Number.isSafeInteger(payload.t)&&payload.t>=0&&
+      if(payload?.e===tradeType&&payload.s===symbol){
+        const price=Number(payload.p), id=futures?payload.a:payload.t;
+        if(Number.isFinite(price)&&price>0&&Number.isSafeInteger(id)&&id>=0&&
           Number.isSafeInteger(payload.T)&&Math.abs(payload.T)<=8640000000000000){
-          onTrade({id:payload.t,price,time:payload.T});
+          onTrade({id,price,time:payload.T});
         }
         return;
       }

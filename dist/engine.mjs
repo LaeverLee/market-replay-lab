@@ -125,13 +125,27 @@ export function computeSignals(rows,strategy) {
   })));
 }
 export function makeAccount(config) {
-  const {capital,fee,slippage,allocation}=config;
+  const {capital,fee,slippage,allocation,leverage=1}=config;
+  if(![1,3].includes(leverage))fail('槓桿須為 1 倍或 3 倍。');
   if(![capital,fee,slippage,allocation].every(Number.isFinite)||capital<1||fee<0||fee>=5||slippage<0||slippage>=5||allocation<=0||allocation>100) fail('本金、部位比例、手續費或滑價超出範圍。');
-  return {capital,cash:capital,fee:fee/100,slip:slippage/100,allocation:allocation/100,pos:null,orders:[],curve:[],equity:capital,peak:capital,drawdown:0,lastClose:null,lastOpen:null,pending:null};
+  return {capital,cash:capital,fee:fee/100,slip:slippage/100,allocation:allocation/100,leverage,pos:null,orders:[],curve:[],equity:capital,peak:capital,drawdown:0,lastClose:null,lastOpen:null,pending:null};
+}
+function settleMarginExhaustion(a,c,adversePrice){
+  if(a.leverage===1||!a.pos)return false;
+  const p=a.pos;
+  const price=(p.side*p.price-p.margin/p.qty)/(p.side-a.fee);
+  if(p.side*(adversePrice-price)>0)return false;
+  const fee=price*p.qty*a.fee;
+  a.cash=Math.max(0,a.cash-p.margin);
+  a.orders.push({action:'exit',signal:c.t,t:c.t,side:p.side,price,qty:p.qty,fee,pnl:-p.margin-p.fee,reason:'模擬保證金耗盡'});
+  a.pos=null;
+  a.pending=null;
+  return true;
 }
 export function onOpen(a,c) {
   if(a.lastOpen!==null&&c.t<=a.lastOpen)return;
   a.lastOpen=c.t;
+  if(settleMarginExhaustion(a,c,c.open))return;
   const order=a.pending;
   a.pending=null;
   if(!order)return;
@@ -141,15 +155,16 @@ export function onOpen(a,c) {
     a.orders.push({...order,t:c.t,side:p.side,price,qty:p.qty,fee,pnl:pnl-fee-p.fee});
     a.pos=null;
   }else if(order.action==='entry'&&!a.pos&&a.cash>0){
-    const price=c.open*(1+order.side*a.slip), notional=a.cash*a.allocation/(1+a.fee), qty=notional/price, fee=notional*a.fee;
+    const price=c.open*(1+order.side*a.slip), notional=a.cash*a.allocation*a.leverage/(1+a.fee*a.leverage), qty=notional/price, fee=notional*a.fee;
     a.cash-=fee;
-    a.pos={side:order.side,price,qty,fee,t:c.t};
+    a.pos={side:order.side,price,qty,fee,margin:notional/a.leverage,t:c.t};
     a.orders.push({...order,t:c.t,price,qty,fee,pnl:null});
   }
 }
 export function onClose(a,c,signals={},strategy={}) {
   if(a.lastClose!==null&&c.t<=a.lastClose)return;
   a.lastClose=c.t;
+  const exhausted=settleMarginExhaustion(a,c,a.pos?.side===1?c.low:c.high);
   const p=a.pos;
   a.equity=a.cash+(p?p.side*(c.close-p.price)*p.qty:0);
   a.peak=Math.max(a.peak,a.equity);
@@ -159,7 +174,7 @@ export function onClose(a,c,signals={},strategy={}) {
     const move=p.side*(c.close/p.price-1)*100;
     const reason=move<=-(strategy.stopPct??Infinity)?'收盤停損':move>=(strategy.takePct??Infinity)?'收盤停利':(p.side===1?signals.exit_long:signals.exit_short)?'策略出場':null;
     if(reason)a.pending={action:'exit',signal:c.t,reason};
-  }else if(Boolean(signals.enter_long)!==Boolean(signals.enter_short)){
+  }else if(!exhausted&&Boolean(signals.enter_long)!==Boolean(signals.enter_short)){
     a.pending={action:'entry',side:signals.enter_long?1:-1,signal:c.t,reason:'策略進場'};
   }
 }
