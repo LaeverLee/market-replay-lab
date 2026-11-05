@@ -20,6 +20,7 @@ export const backtestApi=input=>request('backtests','POST',input);
 
 export const historyApi={
   coverage:()=>request('history-coverage'),
+  batch:input=>request('archive-batch','POST',input),
   replay:input=>request('archive-backtests','POST',input)
 };
 export const pythonStrategyApi={

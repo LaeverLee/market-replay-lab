@@ -92,47 +92,69 @@ export function validateCandles(rows,step=0) {
   }
 }
 export function computeSignals(rows,strategy) {
-  if(strategy.type==='signals') return rows.map(c=>c.signals);
-  const series=Object.fromEntries(fields.map(k=>[k,rows.map(c=>c[k])]));
-  for(const [id,d] of Object.entries(strategy.indicators)){
-    const src=series[d.source??'close'], values=new Array(rows.length), n=d.period;
-    let sum=0, gain=0, loss=0, ema;
-    for(let i=0;i<src.length;i++){
-      const x=src[i];
-      if(d.type==='rsi'){
-        if(!i)continue;
-        const diff=x-src[i-1], up=Math.max(diff,0), down=Math.max(-diff,0);
-        if(i<=n){gain+=up/n;loss+=down/n;}else{gain=(gain*(n-1)+up)/n;loss=(loss*(n-1)+down)/n;}
-        if(i>=n)values[i]=gain+loss===0?50:100*gain/(gain+loss);
-      }else if(d.type==='high'||d.type==='low'){
-        if(i>=n){let value=src[i-n];for(let j=i-n+1;j<i;j++)value=d.type==='high'?Math.max(value,src[j]):Math.min(value,src[j]);values[i]=value;}
-      }else{
-        sum+=x-(i>=n?src[i-n]:0);
-        if(i>=n-1){
-          if(d.type==='ema')ema=ema===undefined?sum/n:ema+2/(n+1)*(x-ema);
-          values[i]=d.type==='ema'?ema:sum/n;
-        }
+  if(strategy.type==='signals')return rows.map(row=>row.signals);
+  return rows.map(createSignalEvaluator(strategy));
+}
+
+function incrementalIndicator(definition){
+  const {type,period}=definition;
+  const recent=new Float64Array(period);
+  let index=0,sum=0,gain=0,loss=0,ema,previous;
+  return value=>{
+    const i=index++, slot=i%period;
+    let result;
+    if(type==='rsi'){
+      if(i){
+        const delta=value-previous, up=Math.max(delta,0), down=Math.max(-delta,0);
+        if(i<=period){gain+=up/period;loss+=down/period;}
+        else{gain=(gain*(period-1)+up)/period;loss=(loss*(period-1)+down)/period;}
+        if(i>=period)result=gain+loss===0?50:100*gain/(gain+loss);
+      }
+    }else if(type==='high'||type==='low'){
+      if(i>=period){
+        result=recent[0];
+        for(let j=1;j<period;j++)result=type==='high'?Math.max(result,recent[j]):Math.min(result,recent[j]);
+      }
+    }else{
+      sum+=value-(i>=period?recent[slot]:0);
+      if(i>=period-1){
+        if(type==='ema')ema=ema===undefined?sum/period:ema+2/(period+1)*(value-ema);
+        result=type==='ema'?ema:sum/period;
       }
     }
-    series[id]=values;
-  }
-  const read=(x,i)=>typeof x==='number'?x:series[x]?.[i];
-  return rows.map((_,i)=>Object.fromEntries(flags.map(key=>{
-    const rules=strategy[key]??[];
-    return [key,i>=strategy.warmup&&rules.length>0&&rules.every(([left,op,right])=>{
-      const a=read(left,i),b=read(right,i);
-      if(!Number.isFinite(a)||!Number.isFinite(b))return false;
-      switch(op){
-        case 'above':return a>b;
-        case 'below':return a<b;
-        case 'gte':return a>=b;
-        case 'lte':return a<=b;
-        case 'crossAbove':return a>b&&read(left,i-1)<=read(right,i-1);
-        case 'crossBelow':return a<b&&read(left,i-1)>=read(right,i-1);
-      }
-    })];
-  })));
+    recent[slot]=previous=value;
+    return result;
+  };
 }
+
+export function createSignalEvaluator(strategy){
+  const indicators=Object.entries(strategy.indicators).map(([name,def])=>[name,def.source??'close',incrementalIndicator(def)]);
+  let previous={}, index=0;
+  const read=(operand,values)=>typeof operand==='number'?operand:values[operand];
+  return row=>{
+    const values=Object.fromEntries(fields.map(key=>[key,row[key]]));
+    for(const [name,source,update] of indicators)values[name]=update(values[source]);
+    const ready=index++>=strategy.warmup;
+    const result=Object.fromEntries(flags.map(key=>{
+      const rules=strategy[key]??[];
+      return [key,ready&&rules.length>0&&rules.every(([left,op,right])=>{
+        const a=read(left,values), b=read(right,values);
+        if(!Number.isFinite(a)||!Number.isFinite(b))return false;
+        switch(op){
+          case 'above':return a>b;
+          case 'below':return a<b;
+          case 'gte':return a>=b;
+          case 'lte':return a<=b;
+          case 'crossAbove':return a>b&&read(left,previous)<=read(right,previous);
+          case 'crossBelow':return a<b&&read(left,previous)>=read(right,previous);
+        }
+      })];
+    }));
+    previous=values;
+    return result;
+  };
+}
+
 export function makeAccount(config) {
   const {capital,fee,slippage,allocation,leverage=1}=config;
   if(![1,3].includes(leverage))fail('槓桿須為 1 倍或 3 倍。');

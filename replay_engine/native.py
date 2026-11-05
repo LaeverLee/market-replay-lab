@@ -12,7 +12,11 @@ from .replay import FIELDS, validate_rows
 
 
 # Only reviewed bundles can be executed by an HTTP request.
-APPROVED = {"BTC-0183@1.0.0": ("BTC-0183", "v1.0.0", "1h")}
+APPROVED = {
+    "BTC-0151@1.0.0": ("BTC-0151", "v1.0.0", "3m"),
+    "BTC-0162@1.0.0": ("BTC-0162", "v1.0.0", "15m"),
+    "BTC-0183@1.0.0": ("BTC-0183", "v1.0.0", "1h"),
+}
 
 
 class NativeCatalog:

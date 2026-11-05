@@ -1,6 +1,6 @@
-import {strategyApi,backtestApi,pythonStrategyApi,historyApi} from './api.mjs';
+import {strategyApi,backtestApi,pythonStrategyApi,historyApi} from './api.mjs?v=batch';
 import {connectMarketFeed} from './live-feed.mjs';
-import {frames,flags,validateStrategy,parseCandles,validateCandles,computeSignals,makeAccount,onOpen,onClose,metrics,ledgerCsv} from './engine.mjs?v=history';
+import {frames,flags,validateStrategy,parseCandles,validateCandles,createSignalEvaluator,makeAccount,onOpen,onClose,metrics,ledgerCsv} from './engine.mjs?v=batch';
 
 const $=id=>document.getElementById(id);
 const glyph={
@@ -74,6 +74,8 @@ const hist={source:'',nativeStrategy:'',symbol:'BTCUSDT',interval:'1h',intervalM
 const defaultLiveInterval='15m';
 const paper={market:'spot',symbol:'BTCUSDT',...initial};
 let ledgerPage={backtest:0,live:0};
+let liveDetail='', backtestDetail='';
+const pythonBatch='python-batch';
 const livePairs=new Map();
 let pairQuery='';
 
@@ -255,10 +257,11 @@ function syncLiveChart(imported){
 }
 function executionPlan(model,mode){
   const sourceRows=mode==='backtest'?historyCandles(model.source):null;
+  const archive=mode==='backtest'&&model.source==='archive';
   return strategies.map(strategy=>({
     strategy,
     reason:mode==='backtest'&&!model.source?'請選擇行情來源':
-      strategyBlockReason(strategy,mode,mode==='live'?liveStrategyInterval(strategy,defaultLiveInterval):model.interval,sourceRows,model.market)
+      strategyBlockReason(strategy,mode,mode==='live'?liveStrategyInterval(strategy,defaultLiveInterval):archive?liveStrategyInterval(strategy,model.interval):model.interval,sourceRows,model.market)
   }));
 }
 function runnableStrategies(model,mode){
@@ -276,7 +279,10 @@ async function backtest(){
     const {source,interval}=settings, snapshot=strategies.find(s=>s.id===source&&s.type==='signals');
     const native=pythonStrategies.find(strategy=>strategy.id===settings.nativeStrategy);
     const frame=interval, step=frames[frame];
-    const ready=native?[]:runnableStrategies(settings,'backtest');
+    const includePython=settings.nativeStrategy===pythonBatch;
+    const ready=native?[]:includePython?executionPlan(settings,'backtest').filter(entry=>!entry.reason).map(entry=>entry.strategy)
+      :runnableStrategies(settings,'backtest');
+    if(includePython&&source!=='archive')throw new Error('多週期 Python 批次請使用本機歷史資料。');
     const sizing=config(settings);
     if(!native)makeAccount(sizing);
     if(native&&!['archive','csv'].includes(source)&&(source!=='futures'||settings.symbol.trim().toUpperCase()!=='BTCUSDT')){
@@ -286,6 +292,16 @@ async function backtest(){
     const to=settings.to?Date.parse(settings.to+'T00:00:00Z')+86400000:Infinity;
     if(from>=to)throw new Error('開始日期須早於或等於結束日期。');
     let rows,label;
+    if(source==='archive'&&!native){
+      const selection=ready.map(strategy=>({id:strategy.id,frame:liveStrategyInterval(strategy,frame)}));
+      if(includePython)selection.push(...pythonStrategies.map(strategy=>({id:strategy.id,frame:strategy.interval})));
+      const response=await historyApi.batch({from,to,sizing,strategies:selection});
+      const accounts=response.results.filter(item=>item.account).map(item=>({...item,interval:item.frame}));
+      result={batch:response,accounts,rows:[],frame:'多週期',label:'本機歷史資料 · BTCUSDT 永續合約'};
+      backtestDetail='';ledgerPage.backtest=0;
+      toast('完成 '+response.results.filter(item=>!item.error).length+'／'+selection.length+' 個策略回測');
+      return;
+    }
     if(source==='archive'){
       const response=await historyApi.replay({frame,from,to,sizing,id:native?.id,strategyIds:ready.map(strategy=>strategy.id)});
       label=(native?native.name+' · ':'')+'本機歷史資料 · BTCUSDT 永續合約';
@@ -339,11 +355,11 @@ function updateFeed(){
   el.className='feed '+(status==='online'?'online':status==='error'?'problem':'');
   el.innerHTML='<i></i>'+({online:'WebSocket 行情已連線',connecting:'正在連線與同步行情',error:'行情連線中斷',paused:live?.accounts.length?'即時模擬已暫停':'行情已暫停',stopped:live?.accounts.length?'即時模擬已結束':'行情已中斷'}[status]??'即時行情未連線');
 }
-function refreshLive(session){
+function refreshLive(session,accountsChanged=true){
   if(live!==session)return;
   updateFeed();
-  if(selectedPage()==='live')renderLiveResults();
-  else if(selectedPage()==='overview')render();
+  if(selectedPage()==='live')renderLiveResults(accountsChanged);
+  else if(selectedPage()==='overview'&&accountsChanged)render();
 }
 function quoteTime(session){
   if(session.trade)return '最新成交 '+time(session.trade.time,true)+' 台北時間';
@@ -383,27 +399,41 @@ function openLiveFeed(session,owner=session){
       const offset=session.history.length-(warmup?.length??0);
       session.history.push(...closed);
       const first=accounts.length?newBars.findIndex(row=>row.t+frames[interval]>session.startedAt):-1;
-      if(first>=0){
-        for(const {account,strategy} of accounts){
-          const signals=computeSignals(session.history,strategy);
-          for(let i=first;i<newBars.length;i++){
-            const row=newBars[i];
-            onOpen(account,row);onClose(account,row,signals[offset+i],strategy);
+      if(newBars.length){
+        for(const item of accounts){
+          const {account,strategy}=item;
+          const initialize=Boolean(warmup||!item.evaluate);
+          if(initialize)item.evaluate=createSignalEvaluator(strategy);
+          const input=initialize?session.history:closed;
+          const start=initialize?offset+first:first;
+          for(let i=0;i<input.length;i++){
+            const row=input[i], signals=item.evaluate(row);
+            if(first>=0&&i>=start){
+              onOpen(account,row);onClose(account,row,signals,strategy);
+            }
           }
         }
+        session.history=session.history.slice(-1000);
       }
-      if(active)accounts.forEach(({account})=>onOpen(account,active));
+      let accountsChanged=first>=0;
+      if(active){
+        for(const {account} of accounts){
+          const before=account.orders.length;
+          onOpen(account,active);
+          accountsChanged||=before!==account.orders.length;
+        }
+      }
       const latest=active??closed.at(-1)??warmup?.at(-1);
       if(primary&&latest&&!session.trade){
         session.price=latest.close;
         session.updated=Date.now();
       }
-      refreshLive(owner);
+      refreshLive(owner,accountsChanged);
     },
     onStatus:(status,error)=>{
       session.status=status;
       session.error=error;
-      if(status==='paused'){
+      if(status==='paused'&&primary){
         disconnectLive(owner);
         owner.status='paused';
         owner.error=primary?error:interval+' · '+error;
@@ -467,7 +497,7 @@ function startLive(quotesOnly=false){
     live.strategyFeeds=[...groups].map(([interval,accounts])=>({
       symbol,market,interval,accounts,startedAt:live.startedAt,status:'connecting',error:''
     }));
-    ledgerPage.live=0;
+    ledgerPage.live=0;liveDetail='';
     render();
     if(!same)openLiveFeed(live);
     for(const feed of live.strategyFeeds)openLiveFeed(feed,live);
@@ -579,10 +609,11 @@ function overview(){
   '<div class="section-head"><h2>工作區概況</h2><span class="mono">SIMULATION / UTC+8</span></div><section class="stats" aria-label="工作區概況">'+
   stat('策略庫',String(strategies.length).padStart(2,'0'),'已匯入的策略','layers')+
   stat('最佳回測報酬',leadMetrics?pct(leadMetrics.returnPct):'—',lead?esc(lead.name):'等待回測','chart',leadMetrics?valueClass(leadMetrics.net):'')+
-  stat('已完成交易',result?String(result.report?.closed_trades??result.accounts.reduce((n,a)=>n+metrics(a.account).trades,0)).padStart(2,'0'):'—','最近一批回測的平倉筆數','target')+
+  stat('已完成交易',result?String(result.batch?result.batch.results.reduce((n,item)=>n+(item.report?.closed_trades??(item.account?metrics(item.account).trades:0)),0):result.report?.closed_trades??result.accounts.reduce((n,a)=>n+metrics(a.account).trades,0)).padStart(2,'0'):'—','最近一批回測的平倉筆數','target')+
   stat('即時執行策略',String(live?.status==='online'?live.accounts.length:0).padStart(2,'0'),live?esc(live.symbol+' · '+live.interval):'等待啟動即時工作階段','activity')+
-  '</section><div class="grid-main">'+(result?plotPanel(result.accounts,result.label+' · '+day(result.rows[0].t)+' 至 '+day(result.rows.at(-1).t)+' UTC',result.frame):'<section class="panel"><div class="panel-head"><h2>策略權益曲線</h2><span class="tag neutral">歷史回測</span></div><div class="empty">'+'執行歷史回測後可查看權益曲線'+'</div></section>')+
-  '<section class="panel"><div class="panel-head"><div><h2>策略觀察清單</h2><p>在同一行情比較不同進出場規則</p></div><span class="tag">'+strategies.length+' 策略</span></div>'+(watch||'<div class="empty">匯入策略後會顯示在這裡</div>')+'<div class="panel-foot"><span class="muted">規則 JSON / 訊號 CSV</span><a class="text-link" href="#library">管理策略 '+icon('arrow')+'</a></div></section></div>'+(result?(result.report?nativeResult(result):comparison(result.accounts)):'');
+  '</section><div class="grid-main">'+(result?.batch?'<section class="panel"><h2>最近一批回測</h2><p>'+result.batch.results.length+' 個策略 · '+day(result.batch.from)+' 至 '+day(result.batch.to-1)+' UTC</p></section>':
+  result?plotPanel(result.accounts,result.label+' · '+day(result.rows[0].t)+' 至 '+day(result.rows.at(-1).t)+' UTC',result.frame):'<section class="panel"><div class="panel-head"><h2>策略權益曲線</h2><span class="tag neutral">歷史回測</span></div><div class="empty">'+'執行歷史回測後可查看權益曲線'+'</div></section>')+
+  '<section class="panel"><div class="panel-head"><div><h2>策略觀察清單</h2><p>在同一行情比較不同進出場規則</p></div><span class="tag">'+strategies.length+' 策略</span></div>'+(watch||'<div class="empty">匯入策略後會顯示在這裡</div>')+'<div class="panel-foot"><span class="muted">規則 JSON / 訊號 CSV</span><a class="text-link" href="#library">管理策略 '+icon('arrow')+'</a></div></section></div>'+(result?(result.batch?batchResults(result):result.report?nativeResult(result):comparison(result.accounts)):'');
 }
 const head=(label,title,subtitle,action='')=>'<div class="page-head"><div><p class="eyebrow">'+label+'</p><h1>'+title+'</h1><p>'+subtitle+'</p></div>'+action+'</div>';
 const input=(label,key,model,type='text',attrs='')=>'<label class="field">'+label+'<input name="'+key+'" type="'+type+'" value="'+esc(model[key])+'" '+attrs+'></label>';
@@ -590,6 +621,13 @@ const options=(values,current)=>values.map(([v,l])=>'<option value="'+esc(v)+'" 
 const select=(label,key,values,current)=>'<label class="field">'+label+'<select name="'+key+'">'+options(values,current)+'</select></label>';
 function backtestIntervalInput(){
   const allowed=backtestFrames(hist);
+  const installed=hist.nativeStrategy===pythonBatch?pythonStrategies:[];
+  const rules=strategies.filter(strategy=>strategy.type!=='signals');
+  if(hist.source==='archive'&&(!hist.nativeStrategy||installed.length)&&
+    rules.every(strategy=>strategyIntervals(strategy).length===1)){
+    const periods=supportedIntervals.filter(frame=>[...rules,...installed].some(strategy=>strategyIntervals(strategy).includes(frame)));
+    if(periods.length)return '<p class="hint">策略週期 · '+esc(periods.join('、'))+'（依策略自動帶入）</p>';
+  }
   if(allowed.length===1)return '<p class="hint">K 線週期 · '+esc(allowed[0])+'（自動帶入）</p>';
   return select('K 線週期','intervalMode',allowed.map(value=>[value,value]),hist.interval);
 }
@@ -604,7 +642,8 @@ function strategyList(model,mode){
   const heading=running?'本次已啟動 '+runningIds.size+' 個':'符合設定 '+ready+' 個';
   const rows=plan.map(({strategy,reason})=>{
     const status=runningIds.has(strategy.id)?'本次已啟動':reason||(running?'下次啟動時執行':'本次會執行');
-    const period=mode==='live'&&(!reason||runningIds.has(strategy.id))?' · '+(runningIds.get(strategy.id)??liveStrategyInterval(strategy,chartInterval)):'';
+    const period=mode==='live'&&(!reason||runningIds.has(strategy.id))?' · '+(runningIds.get(strategy.id)??liveStrategyInterval(strategy,chartInterval)):
+      mode==='backtest'&&model.source==='archive'&&!reason?' · '+liveStrategyInterval(strategy,model.interval):'';
     const style=reason&&!runningIds.has(strategy.id)?' neutral':'';
     return '<li><span>'+esc(strategy.name)+'</span><small class="tag'+style+'">'+esc(status+period)+'</small></li>';
   }).join('');
@@ -613,13 +652,37 @@ function strategyList(model,mode){
     '<button type="button" class="text-link picker-import" data-action="import">'+icon('upload')+'匯入策略檔</button>'+
     (rows?'<ul class="strategy-list">'+rows+'</ul>':'<p class="picker-empty">目前沒有匯入的策略。</p>')+'</div>';
 }
+function batchResults(result){
+  const {batch}=result;
+  const table=batch.results.map(item=>{
+    const stats=item.account?metrics(item.account):null;
+    const end=item.report?.equity.at(-1)?.equity;
+    const initial=item.report?.equity[0]?.equity;
+    const net=stats?.net??(end!==undefined?end-initial:null);
+    const returnPct=stats?.returnPct??(end!==undefined?(end/initial-1)*100:null);
+    const count=stats?.trades??item.report?.closed_trades;
+    const title=esc(item.name);
+    const open=item.error?title:'<button type="button" class="text-link" data-action="backtest-detail" data-id="'+esc(item.id)+'" aria-pressed="'+(backtestDetail===item.id)+'">'+title+'</button>';
+    return '<tr><td>'+open+'</td><td>'+esc(item.frame)+'</td><td>'+esc(item.error??'完成')+'</td><td>'+
+      (returnPct===null?'—':pct(returnPct))+'</td><td>'+(net===null?'—':money(net))+'</td><td>'+(count??'—')+'</td></tr>';
+  }).join('');
+  const active=batch.results.find(item=>item.id===backtestDetail&&!item.error);
+  const overview='<section class="panel table-panel"><div class="panel-head"><div><h2>回測策略概覽</h2><p>'+day(batch.from)+' 至 '+day(batch.to-1)+
+    ' UTC · 點策略名稱查看明細</p></div></div><div class="table-scroll"><table><thead><tr><th>策略</th><th>週期</th><th>狀態</th><th>總報酬</th><th>淨損益</th><th>平倉筆數</th></tr></thead><tbody>'+
+    table+'</tbody></table></div></section>';
+  if(!active)return overview;
+  const rows=batch.charts[active.frame];
+  return overview+candlePanel(rows,active.frame)+(active.report
+    ?nativeResult({report:active.report,rows,label:active.name+' · '+active.frame,id:active.id})
+    :plotPanel([active],active.name,active.frame)+ledger([active],'backtest'));
+}
 function nativeResult(result){
   const {report,rows,label}=result;
   const fills=report.fills.slice(-50).reverse().map(fill=>'<tr><td>'+esc(time(rows[fill.bar].t))+'</td><td>'+
     esc(fill.kind==='entry'?'開倉':'平倉')+' / '+esc(fill.side===1?'多':'空')+'</td><td>'+quotePrice(fill.price)+
     '</td><td>'+esc(fill.qty)+'</td><td>'+quotePrice(fill.fee)+'</td><td>'+esc(fill.reason)+'</td></tr>').join('');
   return '<section class="panel table-panel"><div class="panel-head"><div><h2>Python 策略回測</h2><p>'+esc(label)+
-    '</p></div><button class="button ghost" data-action="download-python-report">下載完整帳務 JSON</button></div>'+
+    '</p></div><button class="button ghost" data-action="download-python-report" data-id="'+esc(result.id??'')+'">下載完整帳務 JSON</button></div>'+
     '<p>平倉 '+report.closed_trades+' 筆 · 期末權益 '+money(report.equity.at(-1).equity)+' USDT</p>'+
     '<p class="muted">採用該策略版本的原始成交與帳務規則。顯示最近 50 筆成交。</p>'+
     '<div class="table-scroll"><table><thead><tr><th>時間</th><th>成交</th><th>價格</th><th>數量</th><th>手續費</th><th>原因</th></tr></thead><tbody>'+
@@ -628,9 +691,9 @@ function nativeResult(result){
 function backtestPage(){
   const native=pythonStrategies.find(strategy=>strategy.id===hist.nativeStrategy);
   const picker=pythonStrategies.length?select('回測策略','nativeStrategy',
-    [['','已匯入的規則與訊號'],...pythonStrategies.map(strategy=>[strategy.id,strategy.name+' · Python '+strategy.interval])],hist.nativeStrategy):'';
+    [['','已匯入的規則與訊號'],...(historyCoverage?.available?[[pythonBatch,'批次 · 已匯入規則與本機 Python']]:[]),...pythonStrategies.map(strategy=>[strategy.id,strategy.name+' · Python '+strategy.interval])],hist.nativeStrategy):'';
   const archiveOption=historyCoverage?.available?[['archive','本機歷史資料 · BTCUSDT 永續合約']]:[];
-  const archiveHint=hist.source==='archive'?'<p class="muted">已收錄 '+esc(historyCoverage.start)+' 至 '+esc(historyCoverage.through)+' UTC。日期留空時取最近 1,000 根。</p>':'';
+  const archiveHint=hist.source==='archive'?'<p class="muted">已收錄 '+esc(historyCoverage.start)+' 至 '+esc(historyCoverage.through)+' UTC。日期留空時，批次會使用同一段近期日期。</p>':'';
   const sources=[['','請選擇行情來源'],...archiveOption,['binance','Binance 現貨'],['futures','Binance USDⓈ-M 永續合約 · 3×'],...(market?[['csv',market.name]]:[]),...strategies.filter(s=>s.type==='signals').map(s=>[s.id,s.name+' · 訊號 CSV'])];
   const marketFields=native?'<p class="hint">'+esc(native.market)+' · 使用策略版本的成交與帳務設定。</p>'+backtestIntervalInput():
     !hist.source?'':['binance','futures'].includes(hist.source)?'<div class="row">'+input('交易對','symbol',hist,'text','required maxlength="20"')+backtestIntervalInput()+'</div>':backtestIntervalInput();
@@ -639,7 +702,7 @@ function backtestPage(){
   '<button type="button" class="button ghost" data-action="market-file">'+icon('upload')+'上傳行情 CSV</button>'+marketFields+
   '<div class="row">'+input('起始日 · UTC','from',hist,'date')+input('結束日 · UTC','to',hist,'date')+'</div>'+(native?'':sizingFields(hist)+strategyList(hist,'backtest'))+
   '<p class="hint">'+(native?'選用 CSV 時請提供符合策略契約的 BTCUSDT 永續合約歷史行情。':'收盤產生訊號，下一根開盤模擬成交。區間結束時按收盤估值。')+'</p><button class="button primary" '+(busy?'disabled':'')+'>'+icon('play')+(busy?'回測執行中…':'執行回測')+'</button>'+(historyError?'<p class="error" role="alert">'+esc(historyError)+'</p>':'')+'</form></section>'+
-  '<div>'+(result?candlePanel(result.rows,result.frame)+(result.report?nativeResult(result):plotPanel(result.accounts,result.label+' · '+day(result.rows[0].t)+' 至 '+day(result.rows.at(-1).t)+' UTC',result.frame)+comparison(result.accounts)+ledger(result.accounts,'backtest')):'<section class="panel"><div class="empty">匯入策略並執行回測，以查看績效與逐筆成交</div></section>')+'</div></div>';
+  '<div>'+(result?.batch?batchResults(result):result?candlePanel(result.rows,result.frame)+(result.report?nativeResult(result):plotPanel(result.accounts,result.label+' · '+day(result.rows[0].t)+' 至 '+day(result.rows.at(-1).t)+' UTC',result.frame)+comparison(result.accounts)+ledger(result.accounts,'backtest')):'<section class="panel"><div class="empty">匯入策略並執行回測，以查看績效與逐筆成交</div></section>')+'</div></div>';
 }
 function liveQuotePanel(){
   if(!live)return '<section class="panel"><div class="panel-head"><h2>即時行情</h2><span class="badge"><i></i>尚未連線</span></div><div class="empty">選擇交易對即可接收 Binance 即時行情</div></section>';
@@ -669,9 +732,22 @@ function liveCandlePanel(){
 }
 function liveAccountPanels(){
   if(!live?.accounts.length)return '';
-  const intervals=[...new Set(live.accounts.map(account=>account.interval))];
-  const label=intervals.length===1?intervals[0]:'多週期';
-  return '<div class="table-panel">'+plotPanel(live.accounts,'收盤估值 · 各策略獨立帳戶',label)+'</div>'+comparison(live.accounts)+ledger(live.accounts,'live');
+  const statusLabel={online:'接收行情',connecting:'同步中',error:'連線中斷',paused:'已暫停',stopped:'已結束'};
+  const rows=live.accounts.map(item=>{
+    const feed=live.strategyFeeds.find(feed=>feed.interval===item.interval)??live;
+    const status=['paused','stopped'].includes(live.status)?live.status:feed.status;
+    const a=item.account, m=metrics(a);
+    const position=a.pos?(a.pos.side===1?'多單':'空單'):'空手';
+    return '<tr><td><button type="button" class="text-link" data-action="live-detail" data-id="'+esc(item.id)+'" aria-pressed="'+
+      (liveDetail===item.id)+'">'+esc(item.name)+'</button></td><td>'+esc(item.interval)+'</td><td>'+esc(statusLabel[status])+'</td><td>'+
+      money(a.equity)+'</td><td class="'+valueClass(m.net)+'">'+pct(m.returnPct)+'</td><td>'+money(m.net)+'</td><td>'+
+      position+(a.pending?' · 待成交':'')+'</td><td>'+m.trades+'</td></tr>';
+  }).join('');
+  const overview='<section class="panel table-panel"><div class="panel-head"><div><h2>即時策略儀表板</h2><p>點策略名稱查看該帳戶的明細 · 權益以收盤估值</p></div></div>'+
+    '<div class="table-scroll"><table><thead><tr><th>策略</th><th>週期</th><th>狀態</th><th>權益</th><th>總報酬</th><th>淨損益</th><th>部位</th><th>平倉筆數</th></tr></thead><tbody>'+rows+'</tbody></table></div></section>';
+  const selected=live.accounts.find(item=>item.id===liveDetail);
+  return overview+(selected?'<div class="table-panel">'+plotPanel([selected],selected.name+' · 個別帳戶',selected.interval)+'</div>'+
+    comparison([selected])+ledger([selected],'live'):'');
 }
 function filteredLivePairs(pairs){
   const query=pairQuery.trim().toUpperCase().replace(/[\s/_-]/g,'');
@@ -731,10 +807,10 @@ function renderLiveCandle(){
   if(caption.textContent!==summary)caption.textContent=summary;
   $('live-candle-plot').innerHTML=plot;
 }
-function renderLiveResults(){
+function renderLiveResults(accountsChanged=true){
   const quote=$('live-quote'),accounts=$('live-accounts');
   if(quote)quote.innerHTML=liveQuotePanel();
-  if(accounts)accounts.innerHTML=liveAccountPanels();
+  if(accounts&&accountsChanged)accounts.innerHTML=liveAccountPanels();
   if(!live?.chart)renderLiveCandle();
   else{
     const select=$('live-chart-interval');
@@ -790,7 +866,8 @@ $('main').addEventListener('change',e=>{
     if(hist.nativeStrategy){
       hist.symbol='BTCUSDT';
       hist.intervalMode='auto';
-      if(!['csv','archive'].includes(hist.source))setHistorySource(historyCoverage?.available?'archive':'futures');
+      if(hist.nativeStrategy===pythonBatch&&historyCoverage?.available&&hist.source!=='archive')setHistorySource('archive');
+      else if(!['csv','archive'].includes(hist.source))setHistorySource(historyCoverage?.available?'archive':'futures');
     }
     historyError='';render();
   }else if(e.target.name==='source'){
@@ -812,9 +889,19 @@ $('main').addEventListener('click',async e=>{
   else if(action==='market-file')$('market-file').click();
   else if(action==='toggle-live')toggleLive();
   else if(action==='stop-live')stopLive();
-  else if(action==='download-python-report'&&result?.report){
-    const report={strategy:result.label,frame:result.frame,candle_timestamps:result.rows.map(row=>row.t),...result.report};
-    download('python-backtest.json',JSON.stringify(report,null,2),'application/json');
+  else if(action==='live-detail'){
+    liveDetail=liveDetail===id?'':id;ledgerPage.live=0;renderLiveResults();
+  }
+  else if(action==='backtest-detail'){
+    backtestDetail=backtestDetail===id?'':id;ledgerPage.backtest=0;render();
+  }
+  else if(action==='download-python-report'){
+    const item=result?.batch?.results.find(item=>item.id===id);
+    const report=item?.report??result?.report;
+    const rows=item?result.batch.charts[item.frame]:result?.rows;
+    if(report)download('python-backtest.json',JSON.stringify({
+      strategy:item?.name??result.label,frame:item?.frame??result.frame,candle_timestamps:rows.map(row=>row.t),...report
+    },null,2),'application/json');
   }
   else if(action==='retry-live-pairs'){
     void loadLivePairs(paper.market);
@@ -831,7 +918,11 @@ $('main').addEventListener('click',async e=>{
     render();toast('已移除 '+s.name);
   }else if(action.startsWith('export-')){
     const kind=action.slice(7), data=kind==='live'?live:result;
-    if(data)download(kind+'-trades.csv',ledgerCsv(data.accounts),'text/csv;charset=utf-8');
+    if(data){
+      const detail=kind==='live'?liveDetail:backtestDetail;
+      const accounts=(kind==='live'||data.batch)&&detail?data.accounts.filter(item=>item.id===detail):data.accounts;
+      download(kind+'-trades.csv',ledgerCsv(accounts),'text/csv;charset=utf-8');
+    }
   }else if(/^(prev|next)-(live|backtest)$/.test(action)){
     const [op,kind]=action.split('-');
     ledgerPage[kind]=Math.max(0,ledgerPage[kind]+(op==='next'?1:-1));

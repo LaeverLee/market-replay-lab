@@ -76,6 +76,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {"accounts": service.backtest(self.body(96 * 1024**2))})
             elif path == "/api/history-coverage" and method == "GET":
                 self.send_json(200, service.history.coverage())
+            elif path == "/api/archive-batch" and method == "POST":
+                self.send_json(200, service.archive_batch(self.body(1024**2)))
             elif path == "/api/archive-backtests" and method == "POST":
                 self.send_json(200, service.archive_backtest(self.body(1024**2)))
             elif path == "/api/python-strategies" and method == "GET":

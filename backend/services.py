@@ -1,7 +1,11 @@
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, timedelta
 from math import inf
+from zipfile import BadZipFile
 import re
 from replay_engine import FLAGS, FRAMES, replay, validate_rows, validate_sizing
 from replay_engine.replay import FIELDS, number
+from .history import millis
 
 RULE_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", re.I)
 COLOR = re.compile(r"#[0-9a-f]{6}", re.I)
@@ -58,6 +62,7 @@ class ReplayService:
         self.repository = repository
         self.native_catalog = native_catalog
         self.history = history
+        self.batch_workers = ThreadPoolExecutor(max_workers=2, thread_name_prefix="archive")
 
     def archive_backtest(self, data):
         if not isinstance(data, dict):
@@ -74,6 +79,83 @@ class ReplayService:
         payload = dict(data, rows=rows, sizing={**sizing, "leverage": 3}, signalStrategies=[])
         payload.update({"from": start, "to": end})
         return {"rows": period, "accounts": self.backtest(payload)}
+
+    def archive_batch(self, data):
+        if not isinstance(data, dict) or not isinstance(data.get("strategies"), list):
+            raise ValueError("請提供批次策略清單。")
+        selection = data["strategies"]
+        if not 1 <= len(selection) <= 1000:
+            raise ValueError("批次需有 1–1,000 個策略。")
+        rules = {rule["id"]: rule for rule in self.repository.list()}
+        natives = {rule["id"]: rule for rule in self.native_catalog.list()}
+        groups = {}
+        seen = set()
+        for item in selection:
+            if not isinstance(item, dict) or not all(isinstance(item.get(k), str) for k in ("id", "frame")):
+                raise ValueError("策略識別碼或週期無效。")
+            key, frame = item["id"], item["frame"]
+            rule = rules.get(key) or natives.get(key)
+            if not rule or key in seen:
+                raise ValueError("批次策略重複或已移除。")
+            allowed = rule.get("intervals") or ([rule["interval"]] if rule.get("interval") else FRAMES)
+            if frame not in allowed:
+                raise ValueError("所選週期與策略契約不相容。")
+            seen.add(key)
+            groups.setdefault(frame, []).append((rule, key in natives))
+
+        sizing = data.get("sizing")
+        if any(not native for items in groups.values() for _, native in items):
+            if not isinstance(sizing, dict):
+                raise ValueError("回測帳戶設定無效。")
+            sizing = {**sizing, "leverage": 3}
+            validate_sizing(sizing)
+        start, end = data.get("from"), data.get("to")
+        if any(value is not None and type(value) is not int for value in (start, end)):
+            raise ValueError("回測區間無效。")
+        # Use the same UTC calendar window for every group, including the default run.
+        coverage = self.history.coverage()
+        if not coverage["available"]:
+            raise ValueError("本機尚未下載歷史資料。")
+        if end is None:
+            end = millis(date.fromisoformat(coverage["through"]) + timedelta(days=1))
+        if start is None:
+            days = max(2, min(30, 1000*min(FRAMES[frame] for frame in groups)//86_400_000))
+            start = max(millis(date.fromisoformat(coverage["start"])), end-days*86_400_000)
+
+        def run_group(frame, items):
+            descriptors = [{"id": rule["id"], "name": rule["name"], "frame": frame}
+                           for rule, _ in items]
+            try:
+                warmup = 1000 if any(not native for _, native in items) else 0
+                rows, first, last = self.history.read(frame, start, end, warmup=warmup)
+                period = [row for row in rows if row["t"] >= first]
+            except ValueError as error:
+                return frame, [], [dict(item, error=str(error)) for item in descriptors]
+            except (OSError, BadZipFile):
+                return frame, [], [dict(item, error="此週期的本機行情檔無法讀取。") for item in descriptors]
+            results = []
+            for (rule, native), item in zip(items, descriptors, strict=True):
+                try:
+                    if native:
+                        item["report"] = self.native_catalog.replay(rule["id"], period, frame)
+                    else:
+                        item.update(color=rule["color"], account=replay(rows, rule, sizing, first, last))
+                except (ValueError, ArithmeticError) as error:
+                    item["error"] = str(error)
+                except OSError:
+                    item["error"] = "本機策略或回測輸出無法讀取。"
+                results.append(item)
+            return frame, period, results
+
+        tasks = [self.batch_workers.submit(run_group, frame, items) for frame, items in groups.items()]
+        results, charts = {}, {}
+        for task in tasks:
+            frame, rows, items = task.result()
+            if rows:
+                charts[frame] = rows
+            results.update((item["id"], item) for item in items)
+        return {"results": [results[item["id"]] for item in selection], "charts": charts,
+                "from": start, "to": end}
 
     def save_rules(self, items):
         if not isinstance(items, list) or len(items) > 1000:
