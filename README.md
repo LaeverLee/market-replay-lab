@@ -32,3 +32,11 @@
 
 
 即時策略 JSON 可用 `"interval": "1h"` 指定固定週期，或用 `"intervals": ["15m", "1h"]` 宣告支援的週期。多週期策略使用啟動時所選的圖表週期（若支援），否則採用 `interval` 指定的預設值或清單第一項。兩個欄位都省略時，策略可使用任何網站支援的週期。
+
+## Render 免費雲端部署
+
+使用此儲存庫根目錄的 `render.yaml` 建立 Render Blueprint，方案選 Free。服務使用 Render 提供的 HTTPS 網址，健康檢查為 `/api/health`。進入網站時使用帳號 `market-replay`，密碼從 Render 服務的 Environment 頁面讀取 `MARKET_REPLAY_PASSWORD`。請勿將密碼寫進 Git。
+
+雲端版會讀取儲存庫的歷史行情，可以執行規則 JSON 和訊號 CSV 回測。原生 Python 策略目錄未隨公開儲存庫部署。免費服務會休眠，重啟可能清除雲端上傳的策略，建議保留匯入檔。即時模擬仍在開啟的瀏覽器頁面運行。
+
+限制與配額見 [Render 免費方案](https://render.com/docs/free)。

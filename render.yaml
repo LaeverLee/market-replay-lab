@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: market-replay-lab
+    runtime: python
+    plan: free
+    buildCommand: python -m compileall -q backend replay_engine
+    startCommand: python -B backend/api.py
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.10
+      - key: MARKET_REPLAY_CLOUD
+        value: "1"
+      - key: MARKET_REPLAY_DATA_DIR
+        value: /tmp/market-replay-lab
+      - key: MARKET_REPLAY_PASSWORD
+        generateValue: true
